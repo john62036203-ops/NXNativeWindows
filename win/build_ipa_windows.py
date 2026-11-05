@@ -50,6 +50,7 @@ def main():
     if Path(getattr(sys.modules.get('sitecustomize'), '__file__', '') or '').resolve() != (SHIM / 'sitecustomize.py').resolve():
         _spec = importlib.util.spec_from_file_location('nxw_shim', SHIM / 'sitecustomize.py'); _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
     sys.path.insert(0, str(WIN)); import toolchain as tc, doctor
+    if str(SHIM) not in sys.path: sys.path.insert(0, str(SHIM))   # the shim's stand-in modules (fcntl) for upstream's imports in this process, as PYTHONPATH gives them to the children
 
     spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', REPO / 'scripts/build_ipa_from_nsp.py')
     up = importlib.util.module_from_spec(spec); sys.modules['build_ipa_from_nsp'] = up; spec.loader.exec_module(up)
