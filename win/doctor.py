@@ -26,6 +26,7 @@ def checks():
         add(f'python module {m}', ok, '', f'python -m pip install {pip}', required=m != 'PIL')
     zs = any(_spec_ok(m) for m in ('compression.zstd', 'backports.zstd'))
     add('python zstd (compression.zstd / backports.zstd)', zs, '', 'python -m pip install backports.zstd (Python before 3.14)')
+    add('python module zbic (Switch 2 game code: ZBIC-compressed NSOs)', _spec_ok('zbic'), '', 'python -m pip install zbic', required=False)
 
     dn = tc.dotnet()
     rc, txt = run([dn, '--list-sdks']) if dn else (1, 'dotnet not found')

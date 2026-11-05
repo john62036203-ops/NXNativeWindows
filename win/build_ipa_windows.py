@@ -282,6 +282,9 @@ def main():
         return out
     up.capture_shaders = capture_shaders
 
+    # dump folders: upstream's pack_dump.clone tries an APFS clone (cp -c) before copying; Windows has no cp, and subprocess raises instead of returning a status
+    if tc.WINDOWS: up.pack_dump.clone = lambda src, dst: shutil.copy2(src, dst)
+
     sys.argv[0] = str(REPO / 'scripts/build_ipa_from_nsp.py')
     return up.cli(sys.argv[1:])   # the upstream entry point: argument parsing, error reporting and the exit code
 

@@ -34,16 +34,27 @@ def py(*args, env=None, capture=True):
 
 
 # ---- dm/host/Makefile, reproduced ----
+def host_msl_dir():
+    """The host's own Metal shaders (dm/gfx/msl/*.metal) compiled for iOS into gen/msl-iphoneos/host_msl_gen.h (dm/gfx/tools/host_msl.py, as the Makefile's MSL_H with MSL_SDK=iphoneos;
+    dm/gfx/nvn/host_msl.m loads them). The generator calls xcrun -sdk iphoneos metal, which the shim maps to the Metal Developer Tools; it keeps the header when its inputs match"""
+    out = HOST / 'gen/msl-iphoneos'; out.mkdir(parents=True, exist_ok=True)
+    srcs = sorted((DM / 'gfx/msl').glob('*.metal'))
+    r = subprocess.run([sys.executable, str(DM / 'gfx/tools/host_msl.py'), '--sdk', 'iphoneos', '--min', tc.setting('ios_deployment', tc.IOS_DEPLOYMENT), str(out / 'host_msl_gen.h'), *map(str, srcs)],
+                       capture_output=True, text=True)
+    if r.returncode or not (out / 'host_msl_gen.h').is_file(): print(r.stdout, r.stderr, file=sys.stderr); die('the host shaders (dm/gfx/tools/host_msl.py)')
+    return out
+
+
 def host_sources(game_h_dir):
     """(sources, include dirs) exactly as `make -n -B dmhost` lists them: SRC, GFX and the libvpx objects' sources; the include order of the host's link line, then libvpx's"""
     mk = (HOST / 'Makefile').read_text(encoding='utf-8')
-    want_src = 'SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m entry.S'
+    want_src = 'SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m entry.S'
     want_gfx = 'GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))'
     for w in (want_src, want_gfx):
         if w not in mk: die(f'dm/host/Makefile changed ({w.split("=")[0]}= line): update host_sources() in win/build_app.py')
-    src = [HOST / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m'.split()]
+    src = [HOST / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m'.split()]
     src += sorted(HOST.glob('hle_*.c'), key=lambda p: p.name)
-    src += [HOST / 'front_mac.m', HOST / 'entry.S']
+    src += [HOST / 'front_mac.m', HOST / 'web_apple.m', HOST / 'entry.S']
     gfx = []
     for pat in ('../gfx/*.c', '../gfx/nvn/*.c', '../gfx/nvn/*.m', '../gfx/nvn/*.S', '../gfx/tex/*.c', '../gfx/tex/*.m', '../gfx/vk/*.m', '../gfx/gl/*.m'):
         d, g = pat.rsplit('/', 1)
@@ -51,9 +62,15 @@ def host_sources(game_h_dir):
     gfx = sorted(gfx, key=lambda p: os.path.relpath(p, HOST).replace('\\', '/'))   # make's $(sort) orders the words as text
     vpx = DM / 'third_party/libvpx'
     vpx_src = sorted(vpx.rglob('*.c'), key=lambda p: p.as_posix())
-    incs = [DM / 'gfx/nvn/include', DM / 'third_party/vulkan-headers/include', game_h_dir, vpx, DM / 'third_party/stb_vorbis', vpx / 'config']
+    # dav1d, the AV1 decoder (hle_movie_av1.c), as the Makefile's DAV1D_SRC: src/*.c but the *_tmpl.c (built through config/tmpl's per-bit-depth wrappers), src/arm/cpu.c,
+    # and the arm64 NEON assembly but the files other assembly files include (*_tmpl.S, util.S)
+    dav = DM / 'third_party/dav1d'
+    dav_src = sorted([f for f in (dav / 'src').glob('*.c') if not f.name.endswith('_tmpl.c')] + [dav / 'src/arm/cpu.c'] + list((dav / 'config/tmpl').glob('*.c'))
+                     + [f for f in (dav / 'src/arm/64').glob('*.S') if not f.name.endswith('_tmpl.S') and f.name != 'util.S'], key=lambda p: p.as_posix())
+    incs = [DM / 'gfx/nvn/include', host_msl_dir(), DM / 'third_party/vulkan-headers/include', game_h_dir, vpx, dav / 'include', DM / 'third_party/stb_vorbis', vpx / 'config',
+            dav, dav / 'config']   # dav1d's own -I (its root and config/) last: the host's headers are found first, as the Makefile's link line has them
     files = []
-    for s in src + gfx + vpx_src:
+    for s in src + gfx + vpx_src + dav_src:
         s = s.resolve()
         if s.stem.endswith('_mac'): continue   # Mac-only sources (front_mac.m): front_ios.m implements front.h
         if s.parent == (IOS / 'Sources').resolve(): continue   # iOS sources the host borrows are compiled once, as iOS sources
@@ -351,7 +368,7 @@ def main():
     py(DM / 'tools/make_ext_font.py', dmres / 'font/nintendo_ext.ttf', tc.letter_font() or die('no bold TTF for the button icons: set LETTER_FONT'))
 
     files, incs = host_sources(gen / 'profile')
-    files += [p.resolve() for p in sorted((IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve(), es.resolve()]
+    files += [p.resolve() for p in sorted((IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/GameMenu.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve(), es.resolve()]
     fws = frameworks(sdk, files)
     rt = compat_rt_needed(clang)
     if rt:

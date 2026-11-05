@@ -23,6 +23,7 @@ This repository is a fork of [seedds/nxnative](https://github.com/seedds/nxnativ
 - [One-time setup](#one-time-setup)
 - [Build an IPA with the window](#build-an-ipa-with-the-window)
 - [Build an IPA from a terminal](#build-an-ipa-from-a-terminal)
+- [Switch 2 games (NUP or a folder of files)](#switch-2-games-nup-or-a-folder-of-files)
 - [Split builds (small IPA + data folder)](#split-builds-small-ipa--data-folder)
 - [Install the IPA on your iPhone or iPad](#install-the-ipa-on-your-iphone-or-ipad)
 - [The launcher on the device](#the-launcher-on-the-device)
@@ -210,7 +211,7 @@ winget install --id LLVM.LLVM -e
 winget install --id Microsoft.DotNet.SDK.10 -e
 winget install --id KhronosGroup.VulkanSDK -e
 winget install --id Meta.Zstandard -e
-python -m pip install lz4 capstone fonttools pillow "backports.zstd; python_version < '3.14'"
+python -m pip install lz4 capstone fonttools pillow zbic "backports.zstd; python_version < '3.14'"
 ```
 
 You need Python 3.10 or later from [python.org](https://www.python.org/downloads/). Check "Add python.exe to PATH" when you install it.
@@ -305,6 +306,21 @@ The options are upstream's (`-h` lists them all):
 | `--split-data` / `--split-data=D:\data\Game-data` | a small app-only IPA plus a data folder ([Split builds](#split-builds-small-ipa--data-folder)) |
 
 Only `--platform ios` builds on Windows. `--prepare-xcode` and the Mac platforms need a Mac.
+
+## Switch 2 games (NUP or a folder of files)
+
+Merged from upstream (seedds/nxnative), **not yet tested on Windows**: upstream tests Switch 2 games on the Mac only, and this repository's Windows build of them has not been run through to a working IPA. What is known: the unpacking (`scripts/pack_nup.py`, `scripts/pack_dump.py`) is pure Python, and the driver swaps in a plain copy for upstream's APFS clone step on Windows.
+
+A Switch 2 game is built from one [NUP](https://github.com/a55uka/nup) container (a `.nup` file) or a folder of its files, not from NSPs, and needs no `prod.keys`. Its code modules are ZBIC-compressed (Nintendo's zstd variant), which the `zbic` pip package reads (`python -m pip install zbic`, Windows wheels on PyPI).
+
+```
+python win\build_ipa_windows.py "E:\ProjectIOS\Games\DonkeyKongBananza.nup"
+python win\build_ipa_windows.py "E:\ProjectIOS\Games\Pokopia" --split-data
+```
+
+A folder is laid out as `base/exefs/` + `base/romfs/`, with optional `updates/<version>/exefs|romfs/` (the version as a decimal number; the romfs is the patched one, not a patch) and `dlc/<title ID>/0/romfs/`. An update's folder alone, or `exefs/` and `romfs/` directly in the folder, counts as the base game. A folder gives the app no icon; a NUP that carries the control data (NACP) and icon gives it both. Upstream's [README](README.nxnative.md#switch-2-games) has the details and the list of profiled games (Donkey Kong Bananza, Mario Kart World, Pokémon Pokopia, Hyrule Warriors: Age of Imprisonment, …).
+
+Switch 2 games address up to 9 GB of game memory. An iPhone with 8 GB (iPhone 16 Pro / 17) runs out of memory on several of them; the per-game READMEs under `dm/games/<title ID>/` name the `env.txt` switches (`DM_MEM_FILE`, `DM_NVN_TEX_SOFT`, `DM_OPMODE`) that help, and which ones only run on 12 GB devices.
 
 ## Split builds (small IPA + data folder)
 
