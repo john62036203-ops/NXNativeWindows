@@ -265,7 +265,7 @@ SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': 
 def record_index(path):   # → (an open descriptor, the offsets of the package's records and its end): record k is bytes offsets[k]..offsets[k + 1]
     # Scanned through a read-only mapping that is closed again, so no package stays in this process. Pokopia's ps_rdb.bin (4.25 GB) read and cut into its 105,118
     # records left the process at 8.7 GB, and each fork (every spirv-cross and Metal compile) then took 75 ms instead of 3 with the GIL held: one shader worker at a time (GitHub issue #1036)
-    fd = os.open(path, os.O_RDONLY); n = os.fstat(fd).st_size
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0)); n = os.fstat(fd).st_size   # O_BINARY: Windows reads in text mode otherwise
     if not n: return fd, [0]
     with mmap.mmap(fd, n, access=mmap.ACCESS_READ) as m: return fd, [x.start() for x in re.finditer(b'BTCDBTCD', m)] + [n]
 
@@ -1479,11 +1479,14 @@ for _spec in [cache_root + ('=' + os.path.dirname(IOSOUT) if IOSOUT else '')] + 
             for _ln in MTL.fill(os.path.join(_mac, _b), os.path.join(_ios, _b) if _ios else None, targets=TARGETS): print(_ln, flush=True)
 packs, jobs, c1s = {}, {}, {}
 digests, rule_fps, cache_reasons, cache_hits = {}, {}, {}, set()
+_PREAD_LOCK = threading.Lock()
 def rec_of(key):   # → (package name, the shader's record), read from the package each time and not kept (see record_index)
     name, k = loc[key]
     if name not in packs: packs[name] = record_index(os.path.join(dm_dir, name))
     fd, offs = packs[name]
-    return name, os.pread(fd, offs[k + 1] - offs[k], offs[k])
+    if hasattr(os, 'pread'): return name, os.pread(fd, offs[k + 1] - offs[k], offs[k])
+    with _PREAD_LOCK:   # Windows has no pread: seek and read under a lock, as threads may share the descriptor
+        os.lseek(fd, offs[k], os.SEEK_SET); return name, os.read(fd, offs[k + 1] - offs[k])
 for key in keys: digests[key] = shader_key(key, *rec_of(key))
 def plain_digest(k):   # a paired pixel shader's key, also when it is not built this time
     if k in digests: return digests[k]

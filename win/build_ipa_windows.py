@@ -17,6 +17,10 @@ SHIM = WIN / 'pyshim'
 
 
 def main():
+    for _s in (sys.stdout, sys.stderr):   # output redirected to a file (Build-OoT-Auto.bat): the console code page cannot write the progress marks
+        try: _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception: pass
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
     if sys.platform == 'darwin': sys.exit('win/build_ipa_windows.py is the Windows and Linux driver: on a Mac run scripts/build_ipa_from_nsp.py')
     if os.name != 'nt': os.environ['NXW_LINUX'] = '1'   # Linux: the shim's mappings with native tools, and the Metal Developer Tools for Windows under Wine (win/toolchain.py cmd)
     for bad in ('--prepare-xcode',):

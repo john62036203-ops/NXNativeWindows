@@ -21,6 +21,7 @@ IOS = DM / 'ios'
 HOST = DM / 'host'
 sys.path.insert(0, str(DM / 'tools'))
 import romfs as rfs   # the RomFS as a folder or as one DMROMFS1 image (nx_extract --romfs-image), read alike
+import shader_lib   # NVN shader libraries as a folder or as one image b-<chain>.img (the NSP script packs them)
 
 
 def t(msg): print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
@@ -289,13 +290,15 @@ def main():
         if not ((patched / f'{m}.patched.bin').exists() and (patched / f'{m}.fixups.tsv').exists()): die(f'no rewritten module {patched}/{m} (run dm/tools/patch_nso.py first)')
     if not (romfs / marker).exists(): die(f'no RomFS at {romfs} (missing {marker})')
     if image and env.get('NXW_MODS_ROMFS'): die('mods\' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)')
-    if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'): die('a split build copies the RomFS as a folder, and this extraction is one RomFS image (RomFS.img): build without --split-data')
+    if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'):   # a split build copies the RomFS as a folder: with one RomFS image (a NUP's RomFS.img) the build packs everything into the IPA instead
+        t('split build: this extraction is one RomFS image (RomFS.img), which a split build cannot copy as a folder: packing the game files and shader libraries into the IPA instead')
+        env['NXW_SPLIT_DATA'] = '0'
     if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them
         import mods
         romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
     hdr = (DM / 'gfx/nvn/dmsh_chain.h').read_text(encoding='utf-8')
     v = (re.search(r'^#define DMSH_CHAIN "(.*)"', hdr, re.M) or die('no DMSH_CHAIN in dmsh_chain.h')).group(1)
-    gfx = env.get('GFXAPI') or ('nvn' if list((msl_ios / f'b-{v}').glob('*_b.metallib')) else 'vulkan' if (msl_ios / 'vk/vk_shaders.metallib').exists()
+    gfx = env.get('GFXAPI') or ('nvn' if shader_lib.has_library(msl_ios / f'b-{v}') else 'vulkan' if (msl_ios / 'vk/vk_shaders.metallib').exists()
                                 else 'gl' if (msl_ios / 'gl/gl_shaders.metallib').exists() else 'nvn')
     capture = env.get('NXW_CAPTURE_IPA') == '1'   # a capture IPA: no shader libraries (the game runs only to compile its run-time shaders, which its env.txt has the host save)
     if capture:
@@ -309,11 +312,10 @@ def main():
         msldir = 'gl'
     else:
         msldir = f'b-{v}'
-        if not list((msl_ios / msldir).glob('*_b.metallib')): die(f'no iOS shader libraries {msl_ios}/{msldir}')
+        if not shader_lib.has_library(msl_ios / msldir): die(f'no iOS shader libraries {msl_ios}/{msldir}')   # the folder b-<chain>, or the one file b-<chain>.img (dm/tools/shader_lib.py)
         inputs = py(DM / 'gfx/tools/dmsh_chain.py', '--inputs', env=dict(env, DM_GAME=game))
-        stamp = (msl_ios / msldir / 'inputs.tsv')
-        lines = stamp.read_text(encoding='utf-8').splitlines() if stamp.exists() else []
-        if f'game\t{game}' not in lines or f'inputs\t{inputs}' not in lines: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
+        stamp = shader_lib.read_stamp(msl_ios / msldir)   # inputs.tsv, from the folder or the image
+        if stamp.get('game', '').strip() != game or stamp.get('inputs', '').strip() != inputs: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
         c1 = gd / 'c1_full.tsv'
         if not (c1.exists() and c1.read_text(encoding='utf-8').splitlines()[:1] and c1.read_text(encoding='utf-8').splitlines()[0].startswith(f'# chain b-{v} inputs {inputs} ')):
             die(f'{c1} is missing or not made from these libraries (chain {v}, inputs {inputs})')
@@ -368,6 +370,7 @@ def main():
     py(DM / 'tools/make_ext_font.py', dmres / 'font/nintendo_ext.ttf', tc.letter_font() or die('no bold TTF for the button icons: set LETTER_FONT'))
 
     files, incs = host_sources(gen / 'profile')
+    if (IOS / 'Sources').resolve() not in incs: incs.append((IOS / 'Sources').resolve())   # win/ios/*.m include the iOS app's headers (DmGameMenu.h, DmLayout.h), as Xcode's project folder does
     files += [p.resolve() for p in sorted((IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/GameMenu.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve(), es.resolve()]
     fws = frameworks(sdk, files)
     rt = compat_rt_needed(clang)
@@ -418,7 +421,14 @@ def main():
     else:
         maps.append(f'Payload/DmIOS.app/msl/{msldir}={msl_ios / msldir}')
         if has_aoc: maps.append(f'Payload/DmIOS.app/aoc={aoc}')
-        maps.append(f'Payload/DmIOS.app/romfs.img={romfs}' if image else f'Payload/DmIOS.app/romfs={romfs}')   # main.m romfs_locate opens <App>/romfs.img (build_ipa.sh)
+        if env.get('DM_COPY_ROMFS', 'YES') == 'NO':   # --romfs separate (build_ipa.sh): no game files in the IPA; the app takes Documents/romfs.img
+            t('no game files in the IPA (DM_COPY_ROMFS=NO): copy RomFS.img into the app\'s Documents once per game version')
+            if image:   # its identity as romfs.id: main.m then uses only a Documents/romfs.img of this size and index hash (dm/host/romfs_identity.h)
+                rid = base / 'romfs.id'; rid.parent.mkdir(parents=True, exist_ok=True)
+                r = subprocess.run([sys.executable, '-I', str(DM / 'tools/romfs_image.py'), '--identity', str(romfs), game, version, pkg or ''], capture_output=True, text=True)
+                if r.returncode or not r.stdout.strip(): die(f'identity of {romfs}: {r.stderr.strip()}')
+                rid.write_text(r.stdout, encoding='utf-8', newline='\n'); maps.append(f'Payload/DmIOS.app/romfs.id={rid}'); t(f'game files identity: {r.stdout.strip()}')
+        else: maps.append(f'Payload/DmIOS.app/romfs.img={romfs}' if image else f'Payload/DmIOS.app/romfs={romfs}')   # main.m romfs_locate opens <App>/romfs.img (build_ipa.sh)
     t('pack IPA (already-compressed game files stored, everything else deflated)')
     r = subprocess.run([sys.executable, str(IOS / 'tools/pack_ipa.py'), str(out_ipa), '--store', ':'.join(gp('zip_store').split(':')),
                         '--exec', 'Payload/DmIOS.app/DmIOS', '--skip', 'Payload/DmIOS.app/msl', '--skip', 'Payload/DmIOS.app/aoc', '--skip', 'Payload/DmIOS.app/romfs', '--skip', 'Payload/DmIOS.app/romfs.img',

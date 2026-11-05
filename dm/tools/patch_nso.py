@@ -653,6 +653,8 @@ def in_parallel(fn, jobs):
     in a destructor."""
     if WORKERS < 2 or len(jobs) < 2:
         return [fn(*job) for job in jobs]
+    if not hasattr(signal, 'pthread_sigmask') or 'fork' not in multiprocessing.get_all_start_methods():   # Windows: no signal masks and no fork, so the jobs run in this process
+        return [fn(*job) for job in jobs]
     def worker_signals():
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
