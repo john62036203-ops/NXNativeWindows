@@ -174,7 +174,8 @@ def main():
         alias region beside Unity's own regions). The profile is stamped as upstream's check stamps it, so later builds keep the result"""
         up.PROG.stage('heap estimate (no Mac host)')
         sig = {}
-        if int(g.get('sys_resource', '0'), 0) and int(g.get('app_pool', '0'), 0) > 0x80000000:
+        if g.get('title_id', '').startswith('04'): up.say('heap estimate: a Switch 2 game (title ID 04...): its pool is the console\'s 9 GB (Mario Kart World, Donkey Kong Bananza): the profile\'s keys are kept')   # the 2 GB estimate is a Switch 1 one
+        elif int(g.get('sys_resource', '0'), 0) and int(g.get('app_pool', '0'), 0) > 0x80000000:
             sig['app_pool'] = ('0x80000000', 'virtual address memory and no heap check on Windows: a 2 GB pool, so StandardAllocator\'s region (pool − used) leaves the alias region room for the game\'s own')
         for k, (v, why) in sig.items(): up.say(f'heap estimate: {k} {v}: {why}')
         if sig: g = up.set_keys(g, sig, 'Heap estimate on Windows (no Mac host)')
@@ -189,7 +190,9 @@ def main():
         it changes no key. Skipped here, and the profile stamped as upstream's check stamps it, so later builds do not ask again"""
         up.PROG.stage('address regions (no Mac host)')
         p = g.dir / 'game.tsv'
-        p.write_text(p.read_text(encoding='utf-8') + f'\n# address regions: {time.strftime("%Y-%m-%d")}, not checked (no Mac host on this PC)\n', encoding='utf-8')
+        # The stamp ends with the rewrite's id, as upstream's does: region_checked looks for that ending, so a stamp without it was never seen and every build appended another and,
+        # game.tsv being a shader input, rebuilt the shader libraries (27 minutes for Ocarina of Time's 42,321)
+        p.write_text(p.read_text(encoding='utf-8') + f'\n# address regions: {time.strftime("%Y-%m-%d")}, not checked (no Mac host on this PC) (rewrite {up.rewrite_id(patched)})\n', encoding='utf-8')
         up.PROG.end('skipped: it only reports, and needs the game booted in the Mac host')
         return type(g)(g.dir)
     up.region_check = region_skip   # newer upstream (after this fork's last sync): heap_check's apple_silicon gate lets it run
