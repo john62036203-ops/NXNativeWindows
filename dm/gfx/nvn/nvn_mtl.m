@@ -428,7 +428,10 @@ static void defer_drain(void) { @autoreleasepool {
 // its virtual pool on other threads: a run of about 10 MB was remade 70 times a second, each old buffer waited for a fence no submission would pass, and 770 MB a second piled up. The buffers
 // are zero-copy, but it was real: 6.7 GB of swap in 20 s, and past the working set the next commit is what the driver refuses, so focus came back to a game that stayed frozen. So a pool's buffer
 // retired with no submission open waits only for what was committed (mtl_pool_del), and the guard's timer drains. Any thread
+// DM_NVN_DEFER_IDLE=0: as before, every retired pool buffer waits for the next submission's feedback
+static int defer_idle_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_DEFER_IDLE"); on = !e || atoi(e); } return on; }
 static void defer_idle(void) {
+    if (!defer_idle_on()) return;
     if (atomic_load(&g_done) < g_fence) return;   // a feedback handler is still to come
     pthread_mutex_lock(&g_deferred_mu); NSUInteger n = g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
     if (n) { defer_drain(); res_commit(); }
@@ -767,7 +770,7 @@ void mtl_pool_del(const void *mem) {
     @autoreleasepool {
     int bg = -1; for (int k = 0; k < g_nbig; k++) if (g_big[k].mem == mem) bg = k;
     for (int i = 0; i < g_npool; i++)
-        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_at(b, 0, g_fence + sub_open()); if (g_pools[i].res) g_pool_res_n--;   // no submission open: none can reach it now that it left the table (defer_idle)
+        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_at(b, 0, g_fence + (defer_idle_on() ? sub_open() : 1)); if (g_pools[i].res) g_pool_res_n--;   // no submission open: none can reach it now that it left the table (defer_idle)
             if (!g_dead_pools) g_dead_pools = [NSHashTable weakObjectsHashTable];
             [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);
             if (i < g_npool) big_moved(i);   // the entry moved into this place
