@@ -7,6 +7,9 @@ static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
 // ---------- prepo: telemetry reports. Saving / submitting all report success; nothing is sent ----------
 HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", "telemetry report save (user); nothing is sent, reports success", Result, h_prepo_SaveU, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
+// SDK 22 (Ounce): reports are sent with the user's ID, PlayReport::Send(Uid) (PlayReportImpl::Send, sdk+0x5aae10 in Ocarina of Time 2.0.0): the original takes the service session (ShimLibraryGlobal::GetSession), connecting to prepo:u, and aborts
+// when that fails (Result 0xe15, the host serves no prepo). Ocarina of Time sends one when its opening movie ends
+HLE_FORCE("_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", "telemetry report send (user); nothing is sent, reports success", Result, h_prepo_SendU, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveEv", "telemetry report save; nothing is sent, reports success", Result, h_prepo_Save, void *self) { (void)self; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects to the prepo service (through sm), the host has no service process; no-op (Engage calls it explicitly)", Result, h_prepo_Init, void) { return RES_OK; }
 // Add the session ID / connection status to a report: on hardware these first connect to the prepo service for the session (Super Mario 3D World + Bowser's Fury calls them entering the save select); the host adds nothing and reports success
