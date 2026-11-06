@@ -17,6 +17,7 @@
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+#include <malloc/malloc.h>   // malloc_zone_pressure_relief: the memory guard (this fork)
 #endif
 #include "nvn_mtl.h"
 #include <mach/mach.h>
@@ -12937,8 +12938,60 @@ static const char *cctx_snap(void) {
 }
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
+// (this fork; the upstream merge 963df56c dropped it with the texture memory saver, which stays out)
+// Memory guard (iOS, every game; DM_MEM_GUARD=0 turns it off): iOS closes the app with no log when os_proc_available_memory reaches 0, so the host watches it twice a second and
+// on the system's memory-pressure events, and steps down before that happens. Level 1, under 600 MB left: the frame rate is capped at 30 (mtl_fps_target, the NVN frame step and the
+// GL swap all follow dm_mem_guard), which halves the per-frame transient memory and lets the deferred-release queue drain. Level 2, under 300 MB left or a critical pressure event:
+// caches go back too: the malloc zones return their free pages (malloc_zone_pressure_relief). The cap lifts once more than 1 GB is left
+// for 15 s in a row. A game whose logic counts frames runs slower while capped, which beats being closed
+static _Atomic int g_mem_level;
+static int g_mem_flushes;
+static void mem_flush(const char *why, size_t left) {
+    size_t freed = malloc_zone_pressure_relief(NULL, 0);
+    g_mem_flushes++;
+    MLOG("memory guard: caches flushed (%s, %zu MB left): %zu MB of free malloc pages returned to the system", why, left >> 20, freed >> 20);
+}
+static void mem_sample(int event) {
+    static double calm_since; static int last_logged = -1;
+    size_t left = os_proc_available_memory();
+    if (!left) return;   // not limited (a Mac)
+    int lv = atomic_load(&g_mem_level), was = lv;
+    if (left < (300u << 20) || event == 2) lv = 2;
+    else if (left < (600u << 20) || event == 1) lv = lv > 1 ? lv : 1;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (left > (1024u << 20)) { if (!calm_since) calm_since = now; if (lv && now - calm_since >= 15) lv = 0; }
+    else calm_since = 0;
+    if (lv == 2 && was < 2) mem_flush(event == 2 ? "critical memory pressure from the system" : "under 300 MB left", left);
+    atomic_store(&g_mem_level, lv);
+    if (lv != last_logged) {
+        last_logged = lv;
+        MLOG("memory guard: %s (%zu MB left before the system's memory limit)", lv == 0 ? "normal, the game's own frame rate" : lv == 1 ? "low, frame rate capped at 30" : "critical, frame rate capped at 30 and caches flushed", left >> 20);
+    }
+}
+static int mem_guard_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_MEM_GUARD"); on = !(e && !strcmp(e, "0")); MLOG("memory guard: %s (DM_MEM_GUARD)", on ? "on: frame rate 30 under 600 MB left, caches flushed under 300 MB" : "off"); } return on; }
+int dm_mem_guard(void) {
+#if TARGET_OS_IPHONE
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!mem_guard_on()) return;
+        dispatch_queue_t q = dispatch_queue_create("nxw.memguard", DISPATCH_QUEUE_SERIAL);
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 500 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(t, ^{ mem_sample(0); });
+        dispatch_resume(t);
+        dispatch_source_t p = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, q);
+        dispatch_source_set_event_handler(p, ^{ unsigned long f = dispatch_source_get_data(p); mem_sample(f & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : f & DISPATCH_MEMORYPRESSURE_WARN ? 1 : 0); });
+        dispatch_resume(p);
+        static void *keep[2]; keep[0] = (__bridge_retained void *)t; keep[1] = (__bridge_retained void *)p;   // live for the whole run
+    });
+    return atomic_load(&g_mem_level);
+#else
+    return 0;
+#endif
+}
+int dm_mem_guard_flushes(void) { return g_mem_flushes; }
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
-    int g = nvn_game_fps(); return env > 0 ? env : g == 30 || g == 120 ? g : 60; }
+    int g = nvn_game_fps(); return dm_mem_guard() ? 30 : env > 0 ? env : g == 30 || g == 120 ? g : 60; }   // the memory guard caps every game at 30 while memory is low (this fork)
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier
