@@ -5375,6 +5375,14 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
         if (o->fn_d) o->fn_d = spec(lib, j[@"entry_d"], cv, &fe);
     }
     if (o->rf.nb) {
+        // A library whose compiler left the argument buffer out (its reflection json still lists bindings) made newArgumentEncoderWithBufferIndex abort the app with a Metal
+        // assertion ("bufferIndex 0 does not identify an argument buffer"): Ocarina of Time on an iPhone, a library from the Windows Metal compiler, from the prefetch. Such a
+        // shader is now refused like one that failed to load (this fork)
+        if (@available(iOS 18.0, macOS 15.0, *)) {
+            MTLFunctionReflection *fr = [lib reflectionForFunctionWithName:entry];
+            if (fr) { int has = 0; for (id<MTLBinding> b in fr.bindings) if (b.type == MTLBindingTypeBuffer && (int)b.index == o->rf.abi) { has = 1; break; }
+                if (!has) { MLOG("[RED] shader %s: its library has no argument buffer at buffer %d although its reflection lists %d bindings: not loaded", pc.UTF8String, o->rf.abi, o->rf.nb); return nil; } }
+        }
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
         int max_aid = -1;
         for (int i = 0; i < o->rf.nb; i++) max_aid = MAX(max_aid, o->rf.b[i].aid + (o->rf.b[i].n ? o->rf.b[i].n - 1 : 0));   // an array takes n entries
