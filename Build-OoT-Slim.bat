@@ -10,6 +10,16 @@ if not defined NUP (
   exit /b 1
 )
 set "OUT=C:\Games\OoT"
+rem The old IPA is replaced at the end of the pack: a program holding it open (Sideloadly, iTunes, Explorer's preview pane) makes that fail after minutes of work, so try now
+if exist "%OUT%\OoT-slim.ipa" (
+  del "%OUT%\OoT-slim.ipa" 2>nul
+  if exist "%OUT%\OoT-slim.ipa" (
+    echo OoT-slim.ipa is open in another program (Sideloadly, iTunes, Explorer preview...). Close it and run this again.
+    pause
+    exit /b 1
+  )
+  del "%OUT%\OoT-slim.ipa.idx" 2>nul
+)
 cd /d D:\nxw
 echo [%time%] Slim build started. Output: %OUT%\console-slim.log
 python win\build_ipa_windows.py "%NUP%" --work-dir "%OUT%\build" -o "%OUT%\OoT-slim.ipa" --entitlements --romfs separate --keep-extracted --allow-other-metal --progress lines > "%OUT%\console-slim.log" 2>&1

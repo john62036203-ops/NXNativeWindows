@@ -369,7 +369,7 @@ def run(cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True):
     tail = collections.deque(maxlen=40)
     p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1)
     try:
-        with open(log, 'w') as f:
+        with open(log, 'w', encoding='utf-8', errors='replace') as f:
             for line in p.stdout:
                 f.write(line); tail.append(line)
                 if on_line:
