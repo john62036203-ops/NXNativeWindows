@@ -70,7 +70,7 @@ static int efd_new(uint64_t v, int flags) {
         return EFD_BASE + i; } }
     t_skerr = 24; return -1;   // EMFILE
 }
-static int efd_close(int fd) { int i = efd_slot(fd); if (i < 0) return sk_fail(); atomic_store(&g_efd_cnt[i], 0); atomic_store(&g_efd_used[i], 0); return 0; }
+static int efd_close(int fd) { int i = efd_slot(fd); { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("socket: Close(%d)%s", fd, i < 0 ? ": not a host descriptor" : ": host eventfd freed"); } if (i < 0) return sk_fail(); atomic_store(&g_efd_cnt[i], 0); atomic_store(&g_efd_used[i], 0); return 0; }
 static int efd_read(int fd, uint64_t *v) {   // never blocks: gRPC reads only after Poll reported POLLIN and takes EAGAIN as nothing to consume
     int i = efd_slot(fd); if (i < 0) { t_skerr = SK_EBADF; return -1; }
     uint64_t c;
@@ -147,7 +147,7 @@ SKF("_ZN2nn6socket4PollEPNS0_6PollFdEmi", h_sk_Poll, void *f, unsigned long n, i
 // to the host's Poll too
 SKF("poll", h_libc_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
 SKF("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", h_sk_Select, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
-SKF("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", h_sk_EventFd, unsigned long v, int f) { return efd_new(v, f); }
+SKF("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", h_sk_EventFd, unsigned long v, int f) { int r = efd_new(v, f); static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("socket: EventFd(%lu, %#x) → %d", v, f, r); return r; }
 SKF("_ZN2nn6socket11EventFdReadEiPm", h_sk_EventFdRead, int s, unsigned long *v) { return efd_read(s, (uint64_t *)v); }
 SKF("_ZN2nn6socket12EventFdWriteEim", h_sk_EventFdWrite, int s, unsigned long v) { return efd_write(s, v); }
 SKF("_ZN2nn6socket17ResolverGetOptionEPNS0_14ResolverOptionENS0_17ResolverOptionKeyE", h_sk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
