@@ -196,6 +196,9 @@ def main():
         up.PROG.end('skipped: it only reports, and needs the game booted in the Mac host')
         return type(g)(g.dir)
     up.region_check = region_skip   # newer upstream (after this fork's last sync): heap_check's apple_silicon gate lets it run
+    # The Mac shader libraries (sh/cache/b-<chain>) serve only the Mac host and the Mac app, neither of which this PC builds: their metallibs are the shim's empty stand-ins, and the tables
+    # (c1_guard, cb_extent) read the MSL and JSON from the folder as well as from an image. So only the iPhone's libraries are packed into one file (upstream packs both: 12 minutes for the Mac's 5.8 GB here)
+    up.pack_libraries = lambda sh, chain, pull=None: up.shader_lib.pack(sh / 'ios' / f'b-{chain}', up.say, leave_out=pull is False)
     xc = [sys.executable, str(WIN / 'xcrun.py')]
     up.toolchain = lambda repo=None, env=None: (('cmd', xc + ['-sdk', 'iphoneos', 'metal', '--version']), ('cmd', xc + ['-sdk', 'macosx', 'metal', '--version']),
                                                 ('cmd', [os.environ.get('SPIRV_CROSS', 'spirv-cross'), '--revision']))
