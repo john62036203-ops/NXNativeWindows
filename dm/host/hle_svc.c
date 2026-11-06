@@ -230,7 +230,21 @@ static void mem_init(void) {
 // and hands the whole block to its own StandardAllocator (main+0x32137a0) -- so heap size = pool − image footprint, it has only as much as the host reports.
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
-#define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
+// DM_APP_POOL_GB=<GB> (env.txt) reports a smaller pool than the profile's, without a rebuild: a game that sizes its heaps and GPU pools by the total it is told may then use less (an 8 GB
+// iPhone runs out of memory where a 12 GB console does not). Only the figure reported and the limits checked against it change; the guest block keeps the profile's size. Larger than the
+// profile's, or unparsable: the profile's
+static uint64_t app_pool_now(void) {
+    static uint64_t v;
+    if (!v) {
+        uint64_t p = DM_GAME_APP_POOL; const char *e = getenv("DM_APP_POOL_GB");
+        if (e && *e) { char *end; double gb = strtod(e, &end);
+            if (end != e && gb >= 1.0 && gb * 1073741824.0 < (double)p) { p = (uint64_t)(gb * 1073741824.0) & ~(uint64_t)0x1fffff; LOG("[mem] application pool reported as %.2f GB (DM_APP_POOL_GB; the profile's is %.2f GB)", p / 1073741824.0, DM_GAME_APP_POOL / 1073741824.0); }
+            else LOG("[RED] [mem] DM_APP_POOL_GB=%s: must be 1 or more and under the profile's %.2f GB; keeping it", e, DM_GAME_APP_POOL / 1073741824.0); }
+        v = p;
+    }
+    return v;
+}
+#define APP_POOL app_pool_now()   // game profile app_pool (Mario 0xCD500000), or DM_APP_POOL_GB
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro) n += g_mod[i].size;   // an NRO lives in memory the game allocated (its image and bss buffers)
     return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,
