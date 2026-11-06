@@ -102,15 +102,22 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
+// Started twice at most: at load (the launch environment) and by the iOS app once Documents/env.txt is applied and the working directory is Documents (main.m: a switch from env.txt is
+// set after the constructors ran, so it used to start nothing). in_documents: a relative name is taken in the working directory, the app's Documents (under LiveContainer HOME is the
+// container app's, not the game's)
+void dm_memstat_start(int in_documents) {
+    static int started; if (started) return;
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
+    started = 1;
     char *path = strdup(p);
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
+    if (*p != '/' && !in_documents) { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
 #endif
+    fprintf(stderr, "[dm] memstat: one line a second to %s\n", path);
     pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
 }
+__attribute__((constructor)) static void memstat_start(void) { dm_memstat_start(0); }
 
 // ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
 // Every interval, walk all threads of this process (task_threads), take the thread name and user + system CPU time (ns) from THREAD_EXTENDED_INFO, and difference them by thread id:
