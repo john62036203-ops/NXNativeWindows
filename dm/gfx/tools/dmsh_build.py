@@ -55,31 +55,106 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
 
-# Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks) reaches the MSL as a call of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1, out D1) → D0, with
-# the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma, TensorPass, HelperFunctionManager.GenerateHmma16816F16). The
-# translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block: A row-major (halves 0..255, 16 a row), B transposed
-# (256..383, row n, 16 halves of k, loaded transposed), C / D row-major (384..511, 8 a row). Per HMMA on an M4 Pro: 1.08 ns a SIMD-group against 5.4 for the shuffle emulation
+# Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
+# flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
+# TensorPass, HelperFunctionManager.GenerateHmma16816F16). The translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block:
+# A row-major (halves 0..255, 16 a row), B transposed (256..383, row n, 16 halves of k, loaded transposed), C / D row-major (384..511, 8 a row). Per HMMA on an M4 Pro: 1.08 ns
+# a SIMD-group against 5.4 for the shuffle emulation. TensorPass's flags (constants at each call) let a call skip the block where a matrix is already in the SIMD-group's
+# registers: each function that calls the helper holds 8 accumulator slots (acc, two matrices each) and A's four matrices (am) and passes them by reference, so the Metal
+# compiler, inlining the helper, keeps them in registers. A chain's accumulator stays in its slot from one call to the next (FlagCSlot / FlagDSlot), a call with the previous
+# call's A loads none (FlagAReuse), C = 0 is a multiply (FlagCZero), and A an LDSM read is loaded from shared memory where it read it (FlagADirect: row 0 of matrix i at lane 0's
+# row address + offset i, rows stride bytes apart, transposed for .MT88), which leaves the LDSM's own per-lane code unused. That needs the caller's shared memory array: the
+# one threadgroup array the calling functions declare besides the scratch, passed as one more argument; with no such array FlagADirect is ignored and A goes through the block.
+# On the NDVE networks of Ocarina of Time's movies (14 dispatches a frame) the frame's compute went from 26.7 to 18.9 ms on an M4 (8 GPU cores)
+# (shaders.md, HMMA chains keep their matrices in the SIMD-group)
 HMMA_BODY = '''{
     threadgroup uint* s = &%(scr)s[uint(%(blk)s)];
-    uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
-    s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s);
-    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);
-    s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup half* h = (threadgroup half*)s;
-    simdgroup_half8x8 a00, a01, a10, a11, b0, b1, c0, c1;
-    simdgroup_load(a00, h, 16, ulong2(0, 0)); simdgroup_load(a01, h, 16, ulong2(8, 0)); simdgroup_load(a10, h, 16, ulong2(0, 8)); simdgroup_load(a11, h, 16, ulong2(8, 8));
+    const int f = int(%(fl)s), k = (f >> 8) * 2;
+    const bool areuse = f & 1, cslot = f & 2, dslot = f & 4, czero = f & 8, adirect = %(adirect)s;
+    uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
+    if (!areuse && !adirect) { s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s); }
+    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);
+    if (!cslot && !czero) { s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s); }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (!areuse && adirect) {
+        threadgroup half* x = %(shm_base)s + (int(simd_broadcast(uint(%(aaddr)s), ushort(0))) >> 1);
+        const ulong st = ulong(uint(%(astr)s) >> 1); const bool tr = f & 32;
+        simdgroup_load(am[0], x + (int(%(ao0)s) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[1], x + (int(%(ao2)s) >> 1), st, ulong2(0, 0), tr);
+        simdgroup_load(am[2], x + (int(%(ao1)s) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[3], x + (int(%(ao3)s) >> 1), st, ulong2(0, 0), tr);
+    } else if (!areuse) {
+        simdgroup_load(am[0], h, 16, ulong2(0, 0)); simdgroup_load(am[1], h, 16, ulong2(8, 0)); simdgroup_load(am[2], h, 16, ulong2(0, 8)); simdgroup_load(am[3], h, 16, ulong2(8, 8));
+    }
+    simdgroup_half8x8 b0, b1;
     simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
-    simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8));
-    simdgroup_multiply_accumulate(c0, a00, b0, c0); simdgroup_multiply_accumulate(c0, a01, b1, c0);
-    simdgroup_multiply_accumulate(c1, a10, b0, c1); simdgroup_multiply_accumulate(c1, a11, b1, c1);
-    simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
+    if (czero) { simdgroup_multiply(acc[k], am[0], b0); simdgroup_multiply(acc[k + 1], am[2], b0); }
+    else {
+        if (!cslot) { simdgroup_load(acc[k], h + 384, 8, ulong2(0, 0)); simdgroup_load(acc[k + 1], h + 384, 8, ulong2(0, 8)); }
+        simdgroup_multiply_accumulate(acc[k], am[0], b0, acc[k]); simdgroup_multiply_accumulate(acc[k + 1], am[2], b0, acc[k + 1]);
+    }
+    simdgroup_multiply_accumulate(acc[k], am[1], b1, acc[k]); simdgroup_multiply_accumulate(acc[k + 1], am[3], b1, acc[k + 1]);
+    if (dslot) { simdgroup_barrier(mem_flags::mem_threadgroup); %(d1)s = 0; return 0; }
+    simdgroup_store(acc[k], h + 384, 8, ulong2(0, 0)); simdgroup_store(acc[k + 1], h + 384, 8, ulong2(0, 8));
     simdgroup_barrier(mem_flags::mem_threadgroup);
     uint d0 = s[192 + g * 4 + t], d1 = s[192 + (g + 8) * 4 + t];
     simdgroup_barrier(mem_flags::mem_threadgroup);
     %(d1)s = as_type<%(dt)s>(d1);
     return as_type<%(rt)s>(d0);
 }'''
+HMMA_ARGS = ['lane', 'blk', 'a0', 'a1', 'a2', 'a3', 'b0', 'b1', 'acc0', 'acc1', 'fl', 'aaddr', 'ao0', 'ao1', 'ao2', 'ao3', 'astr', 'd1']
+HMMA_CALL = re.compile(r'\bdmsh_hmma16816_f16\(([^()]*)\)')
+TG_ARRAY = re.compile(r'^[ \t]+threadgroup (spvUnsafeArray<uint, \d+>) (\w+);[ \t]*$', re.M)
+def split_params(text):   # commas inside template arguments (spvUnsafeArray<uint, N>) do not separate parameters
+    params, depth, cur = [], 0, ''
+    for ch in text + ',':
+        depth += {'<': 1, '>': -1}.get(ch, 0)
+        if ch == ',' and depth == 0: params.append(cur.strip()); cur = ''
+        else: cur += ch
+    return params
+def block_end(src, start):   # the index of the brace closing the block opened at src[start]
+    depth = 0
+    for i in range(start, len(src)):
+        depth += {'{': 1, '}': -1}.get(src[i], 0)
+        if depth == 0: return i
+    raise ValueError('dmsh_hmma16816_f16: block not closed')
+def hmma_msl(msl):
+    m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
+    if not m: return msl
+    params = split_params(m.group(2))
+    scr = [x for x in params if x.startswith('threadgroup ')]
+    plain = [x for x in params if not x.startswith('threadgroup ')]
+    if len(scr) != 1 or len(plain) != len(HMMA_ARGS): raise ValueError('dmsh_hmma16816_f16: unexpected parameters ' + m.group(2)[:200])
+    def group1(pattern, text, how=re.search):   # the first group of a match the helper's signature must have
+        found = how(pattern, text)
+        if not found: raise ValueError('dmsh_hmma16816_f16: unexpected parameter ' + text[:100])
+        return found.group(1)
+    name = lambda x: group1(r'(\w+)$', x)
+    v = dict(zip(HMMA_ARGS, [name(x) for x in plain]), scr=name(scr[0]), dt=group1(r'thread (\w+)&', plain[-1], re.match), rt=m.group(1))
+    body_end = block_end(msl, m.end() - 1)
+    # The calls, and the functions they are in: where each opens its body (a brace at the start of a line), and the shared memory array it declares besides the scratch
+    calls, callers = [], {}
+    for c in HMMA_CALL.finditer(msl):
+        if m.start() <= c.start() <= body_end: continue
+        open_at = msl.rfind('\n{\n', 0, c.start()) + 1
+        if open_at <= 0 or block_end(msl, open_at) < c.start(): raise ValueError('dmsh_hmma16816_f16: a call outside a function body')
+        if open_at not in callers:
+            scratch = split_params(c.group(1))[-1]
+            arrays = [(t, n) for t, n in TG_ARRAY.findall(msl, open_at, block_end(msl, open_at)) if n != scratch]
+            callers[open_at] = arrays[0] if len(arrays) == 1 else None
+        calls.append((c, open_at))
+    if not calls: return msl
+    shared = set(callers.values())
+    direct = len(shared) == 1 and None not in shared
+    extra = ', thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4]' + (', threadgroup %s& dm_shm' % next(iter(shared))[0] if direct else '')
+    v.update(adirect='(f & 16) != 0' if direct else 'false', shm_base='(threadgroup half*)&dm_shm[0]' if direct else '(threadgroup half*)nullptr')
+    # Edits of the original text, applied from its end: the helper itself, each call's added arguments (the caller's matrices and shared memory), each caller's matrices
+    edits = [(m.start(), body_end + 1, '\n%s dmsh_hmma16816_f16(%s%s)\n%s' % (m.group(1), m.group(2), extra, HMMA_BODY % v))]   # spirv-cross has it inlined (always_inline, the line before)
+    edits += [(c.end() - 1, c.end() - 1, ', dm_acc, dm_am' + (', ' + callers[open_at][1] if direct else '')) for c, open_at in calls]
+    edits += [(open_at + 2, open_at + 2, '    simdgroup_half8x8 dm_acc[16], dm_am[4];\n') for open_at in callers]
+    for a, b, text in sorted(edits, key=lambda e: e[0], reverse=True):
+        msl = msl[:a] + text + msl[b:]
+    return msl
+
 # A store only the very first invocation of a dispatch makes (a compute shader's preamble: `if (-local.x == workgroup.x << log2(local size)) buffer[k] = value`). Hoian_Proc in Splatoon Raiders resets its append counter
 # that way, with the other invocations adding to the counter at their end, hundreds of instructions later. On the Switch the first workgroup starts ahead of them. Apple's GPUs start workgroups in no order: a workgroup that had appended before
 # the reset lost its plants to the next one's, a different few each frame, and they flickered. So the store leaves the shader and the host makes it, in order, before the dispatch (the reflection's first_store, nvn_mtl.m). Only this exact
@@ -198,31 +273,6 @@ def gather_offsets(msl):
     msl = ''.join(out)
     k = msl.index('\n', msl.index('using namespace metal;')) + 1
     return msl[:k] + GATHER4 + msl[k:]
-def hmma_msl(msl):
-    m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
-    if not m: return msl
-    params, depth, cur = [], 0, ''   # commas inside template arguments (spvUnsafeArray<uint, N>) do not separate parameters
-    for ch in m.group(2) + ',':
-        depth += {'<': 1, '>': -1}.get(ch, 0)
-        if ch == ',' and depth == 0: params.append(cur.strip()); cur = ''
-        else: cur += ch
-    scr = [x for x in params if x.startswith('threadgroup ')]
-    plain = [x for x in params if not x.startswith('threadgroup ')]
-    if len(scr) != 1 or len(plain) != 11: raise ValueError('dmsh_hmma16816_f16: unexpected parameters ' + m.group(2)[:200])
-    def group1(pattern, text, how=re.search):   # the first group of a match the helper's signature must have
-        found = how(pattern, text)
-        if not found: raise ValueError('dmsh_hmma16816_f16: unexpected parameter ' + text[:100])
-        return found.group(1)
-    name = lambda x: group1(r'(\w+)$', x)
-    names = [name(x) for x in plain]
-    dt = group1(r'thread (\w+)&', plain[10], re.match)
-    v = dict(zip(['lane', 'blk', 'a0', 'a1', 'a2', 'a3', 'b0', 'b1', 'acc0', 'acc1', 'd1'], names), scr=name(scr[0]), dt=dt, rt=m.group(1))
-    start = m.end() - 1; depth = 0
-    for i in range(start, len(msl)):
-        depth += {'{': 1, '}': -1}.get(msl[i], 0)
-        if depth == 0: break
-    else: raise ValueError('dmsh_hmma16816_f16: body not closed')
-    return msl[:start] + HMMA_BODY % v + msl[i + 1:]
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
@@ -304,7 +354,7 @@ SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': 
 def record_index(path):   # → (an open descriptor, the offsets of the package's records and its end): record k is bytes offsets[k]..offsets[k + 1]
     # Scanned through a read-only mapping that is closed again, so no package stays in this process. Pokopia's ps_rdb.bin (4.25 GB) read and cut into its 105,118
     # records left the process at 8.7 GB, and each fork (every spirv-cross and Metal compile) then took 75 ms instead of 3 with the GIL held: one shader worker at a time (GitHub issue #1036)
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0)); n = os.fstat(fd).st_size   # O_BINARY: Windows reads in text mode otherwise
+    fd = os.open(path, os.O_RDONLY); n = os.fstat(fd).st_size
     if not n: return fd, [0]
     with mmap.mmap(fd, n, access=mmap.ACCESS_READ) as m: return fd, [x.start() for x in re.finditer(b'BTCDBTCD', m)] + [n]
 
@@ -1045,14 +1095,6 @@ def reflect(key, stage, msl, res):
             e['rw'] = bool(b and b['flags'] & 1)   # BufferUsageFlags.Write; Program.cs serializes the translator enum unchanged (atomics count as writes too)
     return binds
 
-def raw_log_opt(key, stage, src, res):
-    if not any(b['cb_slot'] == abi.GMEM_MAP_CB_SLOT and b['cb_offset'] == abi.GMEM_LOG_CB_OFFSET for b in res['sbufs']):
-        return src
-    for b in reflect(key, stage, src, res):
-        if b['kind'] == abi.KIND_GMEM_LOG:
-            return dmsh_atomic.raw_log_or(src, b['msl_name'])
-    return src
-
 DRV_FILL = {0: [(b, b + abi.C0_ROW * abi.C0_SSBO_SLOTS) for k, b in sorted(SSBO.items(), key=lambda kv: kv[1]) if k not in ('ts', 'ms')],   # c0: storage buffer address tables (vertex / compute / geometry / pixel; a task or mesh stage's: unfillable())
             2: [(TEX_BASE, SEPTEX_BASE), (IMG_BASE, IMG_BASE + abi.C2_ROW * IMG_SLOTS), (SEPTEX_BASE, SAMP_BASE), (SAMP_BASE, SAMP_BASE + abi.C2_ROW * abi.C2_SEP_SLOTS)]}   # c2: the handle tables above, all filled by the replay layer
 
@@ -1441,9 +1483,8 @@ def geometry_finish(key, w, j, c1):
         r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
         plain = dmsh_geometry.topology_pointer(pool_arrays(precise(dmsh_atomic.check_msl(r.stdout))))
-        res = json.load(open(os.path.join(w, k + '.res.json')))
-        plain = raw_log_opt(key, 'gs', plain, res)
         src = dmsh_geometry.capture_input(plain)
+        res = json.load(open(os.path.join(w, k + '.res.json')))
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                 'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
                 'entry': 'main0', 'msl_entry_kind': 'kernel', 'threadgroup_size': [32, 1, 1],
@@ -1519,9 +1560,6 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
-    res = json.load(open(os.path.join(w, key + '.res.json')))
-    try: src = raw_log_opt(key, j['stage'], src, res)
-    except ValueError as e: return 'reflection failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
     first, spill = [], 0
@@ -1542,6 +1580,7 @@ def finish(key, w, j, c1):
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
     lay = None; discard = False
+    res = json.load(open(os.path.join(w, key + '.res.json')))
     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
@@ -1658,15 +1697,12 @@ def progress(step, done, total, force=False, **extra):
 packs, jobs, c1s = {}, {}, {}
 packs_lock = threading.Lock()
 digests, rule_fps, cache_reasons, cache_hits = {}, {}, {}, set()
-_PREAD_LOCK = threading.Lock()
 def rec_of(key):   # → (package name, the shader's record), read from the package each time and not kept (see record_index)
     name, k = loc[key]
     with packs_lock:
         if name not in packs: packs[name] = record_index(os.path.join(dm_dir, name))
     fd, offs = packs[name]
-    if hasattr(os, 'pread'): return name, os.pread(fd, offs[k + 1] - offs[k], offs[k])
-    with _PREAD_LOCK:   # Windows has no pread: seek and read under a lock, as threads may share the descriptor
-        os.lseek(fd, offs[k], os.SEEK_SET); return name, os.read(fd, offs[k + 1] - offs[k])
+    return name, os.pread(fd, offs[k + 1] - offs[k], offs[k])
 for key in keys: digests[key] = shader_key(key, *rec_of(key))
 def plain_digest(k):   # a paired pixel shader's key, also when it is not built this time
     if k in digests: return digests[k]
