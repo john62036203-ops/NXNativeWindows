@@ -2,14 +2,39 @@
 // Only entry points that go to a service are hooked; library functions that only read and write the game's own buffers (prepo Add / Array / Struct, err ErrorResultVariant, friends getters, socket byte-order conversion) keep running in the SDK.
 // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
 #include "hle.h"
+#include <stdatomic.h>
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
 // ---------- prepo: telemetry reports. Saving / submitting all report success; nothing is sent ----------
 HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", "telemetry report save (user); nothing is sent, reports success", Result, h_prepo_SaveU, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
-// SDK 22 (Ounce): reports are sent with the user's ID, PlayReport::Send(Uid) (PlayReportImpl::Send, sdk+0x5aae10 in Ocarina of Time 2.0.0): the original takes the service session (ShimLibraryGlobal::GetSession), connecting to prepo:u, and aborts
-// when that fails (Result 0xe15, the host serves no prepo). Ocarina of Time sends one when its opening movie ends
-HLE_FORCE("_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", "telemetry report send (user); nothing is sent, reports success", Result, h_prepo_SendU, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
+// SDK 22 (Ounce): reports are sent with the user's ID, AsyncContext PlayReport::Send(Uid) (PlayReportImpl::Send, sdk+0x5aae10 in Ocarina of Time 2.0.0): the original takes the service session
+// (ShimLibraryGlobal::GetSession), connecting to prepo:u, and aborts when that fails (Result 0xe15, the host serves no prepo). Ocarina of Time sends one when its opening movie ends, then
+// (main+0x3791640) gets the context's completion event, waits on it, reads its result and destroys event and context. Send returns the context by value: a C++ object with a destructor,
+// so through the address in x8 (16 bytes there); a stub passes x8 on as the third argument. The host's context is marked done: its completion event is created signalled, its result is success
+#define PREPO_CTX_MAGIC 0x6f7065727074736fULL   // "osptrepo": a context the host made
+static void h_prepo_SendU(void *self, const void *uid, uint64_t *ctx) __attribute__((used));
+static void h_prepo_SendU(void *self, const void *uid, uint64_t *ctx) {
+    (void)self; (void)uid;
+    if (ctx) { ctx[0] = PREPO_CTX_MAGIC; ctx[1] = 0; }
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) LOG("prepo: PlayReport::Send(user): nothing is sent, the request is done at once");
+}
+extern const char h_prepo_SendU_x8[];
+__asm__(".text\n.p2align 2\n_h_prepo_SendU_x8:\n    mov x2, x8\n    b _h_prepo_SendU\n");
+__attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_h_prepo_SendU = {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", (void *)(uintptr_t)h_prepo_SendU_x8,
+    "telemetry report send (user): nothing is sent, the async context returned (through x8) is done"};
+HLE_FORCE("_ZN2nn5prepo12AsyncContext18GetCompletionEventEPNS_2os11SystemEventE", "telemetry async context: its completion event, created signalled", Result, h_prepo_AcEvent, void *self, void *ev) {
+    (void)self;
+    static uint32_t (*create)(void *, int, int); static void (*sig)(void *);
+    if (!create) { create = guest_sym("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb"); sig = guest_sym("_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE"); }
+    if (!create || !sig) die("prepo: no nn::os::CreateSystemEvent / SignalSystemEvent in the SDK");
+    uint32_t r = create(ev, 0, 0);   // manual clear, not interprocess
+    if (r) die("prepo: CreateSystemEvent failed %#x", r);
+    sig(ev);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn5prepo12AsyncContext9GetResultEv", "telemetry async context: success", Result, h_prepo_AcResult, void *self) { (void)self; return RES_OK; }
+HLE_FORCE("_ZN2nn5prepo12AsyncContextD1Ev", "telemetry async context: the host's holds nothing", void, h_prepo_AcDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveEv", "telemetry report save; nothing is sent, reports success", Result, h_prepo_Save, void *self) { (void)self; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects to the prepo service (through sm), the host has no service process; no-op (Engage calls it explicitly)", Result, h_prepo_Init, void) { return RES_OK; }
 // Add the session ID / connection status to a report: on hardware these first connect to the prepo service for the session (Super Mario 3D World + Bowser's Fury calls them entering the save select); the host adds nothing and reports success
