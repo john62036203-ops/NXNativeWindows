@@ -316,6 +316,7 @@ def main():
             while pend: inflight -= one()
         z.close()
         st = os.stat(part)   # bind the index to this file before publishing; rename preserves its mtime
+        if old: old.close(); old = None   # Windows refuses to replace a file that is open (the old IPA, read for its reusable entries)
         os.replace(part, a.out)
     except BaseException:
         if z: z.f.close()
