@@ -79,7 +79,9 @@ static int efd_read(int fd, uint64_t *v) {   // never blocks: gRPC reads only af
         while (c && !atomic_compare_exchange_weak(&g_efd_cnt[i], &c, c - 1)) {}
         if (c) c = 1;
     } else c = atomic_exchange(&g_efd_cnt[i], 0);
-    if (!c) { t_skerr = SK_EAGAIN; return -1; }
+    // Nothing to take: success with 0, not EAGAIN. gRPC's consume (main+0x21f3ac0) reads the guest libc's errno (__errno_location) on a failure, which the host does not set, and takes
+    // anything but EINTR / EAGAIN (11) as fatal; it reads only after Poll reported POLLIN, and a success ends its loop either way
+    if (!c) { if (v) *v = 0; return 0; }
     if (v) *v = c; return 0;
 }
 static int efd_write(int fd, uint64_t v) { int i = efd_slot(fd); if (i < 0) { t_skerr = SK_EBADF; return -1; } atomic_fetch_add(&g_efd_cnt[i], v); return 0; }
