@@ -2,6 +2,7 @@
 setlocal
 rem Slim IPA of Ocarina of Time: the app and shaders only, no game files (RomFS).
 rem The game files (RomFS.img) are copied into the app's Documents once; later updates only need this small IPA.
+rem --allow-damaged: this dump has 3 texture .zs files that start with zeros (Fairy Fountain floor, Ganon stage bake, Water Temple gate); they are packed as they are
 set "NUP="
 for /d %%D in ("%USERPROFILE%\Downloads\*DUMP") do for %%F in ("%%D\*.nup") do set "NUP=%%F"
 if not defined NUP (
@@ -21,7 +22,7 @@ if exist "%IPA%" (
 if exist "%OUT%\OoT-slim-new.ipa" if "%IPA%"=="%OUT%\OoT-slim-new.ipa" del "%OUT%\OoT-slim-new.ipa" 2>nul
 cd /d D:\nxw
 echo [%time%] Slim build started: %IPA%. Output: %OUT%\console-slim.log
-python win\build_ipa_windows.py "%NUP%" --work-dir "%OUT%\build" -o "%IPA%" --entitlements --romfs separate --keep-extracted --allow-other-metal --progress lines > "%OUT%\console-slim.log" 2>&1
+python win\build_ipa_windows.py "%NUP%" --work-dir "%OUT%\build" -o "%IPA%" --entitlements --romfs separate --keep-extracted --allow-other-metal --progress lines --allow-damaged > "%OUT%\console-slim.log" 2>&1
 set "RC=%errorlevel%"
 if "%RC%"=="0" (
   echo [%time%] Done: %IPA%
