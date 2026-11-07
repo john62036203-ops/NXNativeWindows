@@ -41,6 +41,9 @@ shader_note	Ocarina of Time shaders
 render_cond	on
 gpu_timestamps	segment
 draw_barriers	game
+# The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): Kokiri Forest 27.1 -> 24.9 ms docked on an M4 Pro
+# (cheemu21/kid-with-sword-remake 21b7b681, from the Mighty Green Kokiri Kid fork 5208584a)
+dispatch_overlap	on
 # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
 tex_flush_upload	on
 tex_dirty_upload	on
