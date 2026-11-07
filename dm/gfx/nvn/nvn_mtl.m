@@ -4338,6 +4338,22 @@ static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d)
     if (all_new && !tex_init_fill(t, mt, 0)) tex_zero_fill(mt);
     return mt;
 }
+// DM_NVN_RT_LOSSY=1 (rt_lossy from cheemu21's kid-with-sword-remake, via the Mighty Green Kokiri Kid fork b60b3f03 / 2558e8cd): a colour render target the GPU only draws into
+// (no shader writes or atomics, no format views, private, 2D) is made with Metal's lossy compression, which Apple GPU family 8 and later keep in about half the memory and bandwidth;
+// precision drops a little where neighbouring colours differ. An allow-list of formats, as Metal stops the process at one with no lossy form (RG11B10Float, the scene colour, is one).
+// Render targets in a placement heap (pool_heap_texture, image_texture) keep theirs; a texture Metal refuses this way is made lossless. Off by default
+static uint64_t g_rtl_n, g_rtl_bytes;
+static void rt_lossy(MTLTextureDescriptor *d) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_RT_LOSSY"); on = e && atoi(e) != 0 && [g_dev supportsFamily:MTLGPUFamilyApple8];
+        if (on) MLOG("DM_NVN_RT_LOSSY: lossy compression for colour render targets drawn as attachments only"); }
+    if (!on || !(d.usage & MTLTextureUsageRenderTarget) || (d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView)) || d.storageMode != MTLStorageModePrivate) return;
+    if (d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) return;
+    MTLPixelFormat f = d.pixelFormat;
+    if (f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB && f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatBGRA8Unorm_sRGB && f != MTLPixelFormatRGBA16Float) return;
+    d.allowGPUOptimizedContents = YES; d.compressionType = MTLTextureCompressionTypeLossy;
+    g_rtl_n++; g_rtl_bytes += (uint64_t)d.width * d.height * (f == MTLPixelFormatRGBA16Float ? 8 : 4);
+    static uint64_t nl; if (nl++ < 2 || !(nl & (nl - 1))) MLOG("DM_NVN_RT_LOSSY: %llu render targets lossy so far, %llu MB uncompressed", (unsigned long long)g_rtl_n, (unsigned long long)(g_rtl_bytes >> 20));
+}
 static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
@@ -4489,7 +4505,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         mt = image_texture(t, d);
         int filled = 0;
         if (!mt) mt = pool_heap_texture(t, d);
+        if (!mt) rt_lossy(d);   // DM_NVN_RT_LOSSY
         if (!mt) { mt = rc_take(d, t); if (!mt) mt = [g_dev newTextureWithDescriptor:d];   // rc_take: DM_NVN_RT_RECLAIM's free list (upstream PR #1588)
+            if (!mt && d.compressionType == MTLTextureCompressionTypeLossy) { d.compressionType = MTLTextureCompressionTypeLossless; mt = [g_dev newTextureWithDescriptor:d]; }   // refused lossy (rt_lossy)
             if (mt) { res_add(mt); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
