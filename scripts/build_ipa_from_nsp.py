@@ -2172,7 +2172,9 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
         PROG.set(step='building the Mac host for the game\'s Oodle decoder'); env = dict(env, **oodle())
         host = Path(env['DM_OODLE_HOST'])
         inputs += [('decoder', decoder_host_key(host) or fingerprint(('files', [host]))), ('modules', package_key(Path(env['DM_OODLE_MODULES'])))]
-    key = None if ALLOW_DAMAGED else fingerprint(*inputs, *split_profile_inputs(g))
+    # --allow-damaged: the damaged files are part of the RomFS the fingerprint reads, byte for byte, so the same damaged dump reuses its split as a whole one does (Ocarina of
+    # Time's NUP with three zeroed .zs: 53 minutes of split on every build otherwise)
+    key = fingerprint(*inputs, *split_profile_inputs(g), ('damaged', 1) if ALLOW_DAMAGED else ('damaged', 0))
     dlckf, dlckey = pkg.with_name(pkg.name + '.dlc.key'), None
     cskf, cskey, promoted = pkg.with_name(pkg.name + '.compute.key'), None, None
     def promote(derive, kind):
