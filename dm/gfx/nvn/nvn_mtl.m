@@ -463,8 +463,8 @@ static void defer_obj_at(id obj, int keep_resident, uint64_t fence) {
     [g_deferred addObject:d];
     pthread_mutex_unlock(&g_deferred_mu);
 }
-static void defer_obj_release(id obj) { defer_obj_release_ex(obj, 0); }
-static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
+static void defer_obj_release(id obj) { defer_obj_at(obj, 0, g_fence + 1); }
+static void defer_obj_unref(id obj) { defer_obj_at(obj, 1, g_fence + 1); }
 static pthread_mutex_t g_smu; static int entry_holds(const void *o); static void retire_wait(id o);   // defined below (the serial table)
 // Its own autorelease pool: mtl_sub_begin drains before it pushes the submission's pool, on the guest submit thread, whose implicit pool is never drained. The weak-table lookups and the residency-set removal
 // autorelease the retired object, so whatever that thread drained (instead of the completion handler, which wins the race only when the CPU is idle) stayed alive for good: in Metroid Dread every
@@ -2845,7 +2845,7 @@ static void rc_area_add(float x0, float y0, float x1, float y1) {   // a draw's 
     if (!g_rc_area_any) { g_rc_area[0] = x0; g_rc_area[1] = y0; g_rc_area[2] = x1; g_rc_area[3] = y1; g_rc_area_any = 1; return; }
     if (x0 < g_rc_area[0]) g_rc_area[0] = x0; if (y0 < g_rc_area[1]) g_rc_area[1] = y0; if (x1 > g_rc_area[2]) g_rc_area[2] = x1; if (y1 > g_rc_area[3]) g_rc_area[3] = y1;   // the bounding box: separate rectangles that leave a hole count as covering it (rare for full-target passes)
 }
-static void rc_write(const tex_t *t) {
+static void rc_write_tex(const tex_t *t) {
     if (!t || !t->serial || !t->mem || !t->L.size || !rc_on()) return;
     pthread_mutex_lock(&g_rc_mu);
     int was_gone = nvn_hm_del(&g_rc_gone, &t->serial) != NULL;
@@ -14917,7 +14917,7 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a; g_setrt_n++;
-                if (g_rc_on_ == 1) { rc_pass_end(); for (int i = 0; i < r->n && i < 8; i++) rc_write(r->color[i]); rc_write(r->depth); } else if (g_rc_on_) { for (int i = 0; i < r->n && i < 8; i++) rc_write(r->color[i]); rc_write(r->depth); }   // DM_NVN_RT_RECLAIM
+                if (g_rc_on_ == 1) { rc_pass_end(); for (int i = 0; i < r->n && i < 8; i++) rc_write_tex(r->color[i]); rc_write_tex(r->depth); } else if (g_rc_on_) { for (int i = 0; i < r->n && i < 8; i++) rc_write_tex(r->color[i]); rc_write_tex(r->depth); }   // DM_NVN_RT_RECLAIM
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
