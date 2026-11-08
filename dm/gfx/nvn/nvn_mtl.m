@@ -15293,14 +15293,14 @@ static void ndve_log(NvShader *cs, const p_dispatch *dp, int i) {
 }
 // The chain seen in a title run (DM_NDVE_LOG, NOTES 2026-11-05 ~17:30), per movie frame: #20 49dff010 (colour conversion: t1 = Y R8 1920x1080, t2 = CbCr RG8 960x540 → image 0 = RGBA8 1920x1080,
 // gamma-encoded video colour), #2-#10 (the RLA1 network over that picture: buffers, #10 writes an RGB10A2 1920x1080 image), #1 4f41ccf2 (NDSR upscale: texture 0 = the network's picture,
-// image 1 = the RGBA8 2560x1440 output; push constants = input / output rectangles as up_mfx_rect reads them). DM_NDVE=metalfx (default): #20 runs, the network is skipped, and MetalFX's spatial
+// image 1 = the RGBA8 2560x1440 output; push constants = input / output rectangles as up_mfx_rect reads them). DM_NDVE=metalfx: #20 runs, the network is skipped, and MetalFX's spatial
 // scaler (perceptual, the colour kept encoded) scales #20's picture into #1's output rectangle; off: a bilinear draw instead; game: the game's shaders. Read at every movie frame (ctl "env").
 // Anything unexpected (a shader outside that order, bindings, sizes, MetalFX refusing) keeps the game's chain from the next movie frame on
 enum { NDVE_GAME, NDVE_METALFX, NDVE_OFF };
 static int g_ndve_armed, g_ndve_failed, g_ndve_last = -1; static id<MTLTexture> g_ndve_in; static uint64_t g_ndve_n, g_ndve_skipped;
 static int ndve_mode(void) {
     const char *e = getenv("DM_NDVE");
-    int m = !e || !*e || !strcmp(e, "metalfx") ? NDVE_METALFX : !strcmp(e, "off") ? NDVE_OFF : NDVE_GAME;
+    int m = e && !strcmp(e, "metalfx") ? NDVE_METALFX : e && !strcmp(e, "off") ? NDVE_OFF : NDVE_GAME;   // a12-ios: the game's network by default (the MetalFX route froze the title movie on an iPhone 16 Pro Max); DM_NDVE=metalfx / off still choose
     static int fx = -1; if (fx < 0) fx = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev];
     if (m == NDVE_METALFX && !fx) m = NDVE_GAME;
     if (m != g_ndve_last) { MLOG("movie NDVE (DM_NDVE=%s): %s", e ? e : "", m == NDVE_METALFX ? "MetalFX spatial scaler" : m == NDVE_OFF ? "bilinear draw" : "the game's network"); g_ndve_last = m; }

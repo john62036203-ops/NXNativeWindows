@@ -17,6 +17,11 @@ import argparse, atexit, collections, concurrent.futures as cf, ctypes, json, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'tools'))
 import shader_lib
+import threading
+_PREAD_LOCK = threading.Lock()
+def pread(fd, n, at):   # os.pread, which Windows lacks: a seek and a read under a lock (the old IPA's descriptor is shared by the match threads)
+    if hasattr(os, 'pread'): return os.pread(fd, n, at)
+    with _PREAD_LOCK: os.lseek(fd, at, os.SEEK_SET); return os.read(fd, n)
 
 LEVEL = 6
 IDX_VERSION = 3
@@ -24,6 +29,7 @@ BIG = 256 << 20      # files above this are streamed by the writer; smaller ones
 WINDOW = 2 << 30     # input bytes in the pool at once
 QUEUE = 4096         # entries in the pool at once (folders of tiny files)
 CHUNK = 16 << 20
+EXEC = set()   # --exec: archive paths that get mode 755 when packing on Windows (the app's executable)
 L32, L16 = 0xFFFFFFFF, 0xFFFF
 DIR_MODE = stat.S_IFDIR | 0o755   # a parent folder no source folder stands for (Payload/, msl/); its time is 1980-01-01, so it is the same in every pack
 Entry = collections.namedtuple('Entry', 'name path st root')   # st None: a synthetic parent; root: the mapping's source folder
@@ -120,6 +126,8 @@ class Zip:
         z = [v for v in (usize, csize, off) if v >= L32]   # zip64 extra: the fields that do not fit, in this order
         ext = struct.pack(f'<HH{len(z)}Q', 1, 8 * len(z), *z) if z else b''
         mode = e.st.st_mode if e.st else DIR_MODE
+        if os.name == 'nt' and e.st:   # Windows has no Unix modes (files read as 0o666 without x): folders 755, the --exec files 755, everything else 644, as Info-ZIP on a Mac writes them
+            mode = DIR_MODE if stat.S_ISDIR(mode) else stat.S_IFREG | (0o755 if e.name in EXEC else 0o644)
         self.cd.append(struct.pack('<IHHHHHHIIIHHHHHII', 0x02014B50, 0x031E, 45 if z else 20 if method == 8 else 10, fl, method, t, d, crc, min(csize, L32), min(usize, L32),
                                    len(nb), len(ext), 0, 0, 0, (mode << 16) | (0x10 if stat.S_ISDIR(mode) else 0), min(off, L32)) + nb + ext)
         self.stats['deflated' if method == 8 else 'stored'] += usize
@@ -165,7 +173,7 @@ class Zip:
         left, at = csize, info.header_offset + 30 + nl + el
         h = self.local(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
         while left:
-            b = os.pread(old.fileno(), min(CHUNK, left), at)
+            b = pread(old.fileno(), min(CHUNK, left), at)
             if not b: sys.exit(f'[RED] pack_ipa: the old IPA ended while {e.name} was copied from it')
             self.w(b); left -= len(b); at += len(b)
         self.central(e, h, method, crc, csize, usize)
@@ -213,7 +221,7 @@ def match(e, row, info, old, idx, apfs):   # one header comparison for both the 
         if (info.compress_type, info.CRC, info.compress_size, info.file_size) != (method, crc, csize, usize): return None
     h = header(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
     if info.header_offset < 0 or info.header_offset + len(h[0]) + csize > idx['ipa'][0]: return None
-    if os.pread(old.fileno(), len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
+    if pread(old.fileno(), len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
     return h
 
 
@@ -251,7 +259,9 @@ def main():
     ap.add_argument('--skip', action='append', default=[], help='an archive path left out of the folder walk that would add it')
     ap.add_argument('--skip-suffix', action='append', default=[], help='files whose names end so are left out of every folder walk')
     ap.add_argument('--no-reuse', action='store_true', help='pack every file again, without copying from the old IPA')
+    ap.add_argument('--exec', action='append', default=[], help='an archive path packed with mode 755 on Windows, which has no x bit (the app executable)')
     a = ap.parse_args()
+    EXEC.update(p.strip('/') for p in a.exec)
     maps = []
     for m in a.maps:
         arc, sep, src = m.partition('=')
@@ -306,6 +316,7 @@ def main():
             while pend: inflight -= one()
         z.close()
         st = os.stat(part)   # bind the index to this file before publishing; rename preserves its mtime
+        if old: old.close(); old = None   # Windows refuses to replace a file that is open (the old IPA, read for its reusable entries)
         os.replace(part, a.out)
     except BaseException:
         if z: z.f.close()
