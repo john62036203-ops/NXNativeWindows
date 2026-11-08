@@ -14,7 +14,8 @@ SRC_IPA = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r'C:\OOT\OcarinaOfTim
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(r'C:\OOT\OoT-A12-fix.ipa')
 EXEFS = Path(r'C:\Games\OoT\build\extract\v131072\ExeFS')
 ICON = EXEFS.parent / 'icon.jpg'
-ROMFS = Path(r'C:\Users\john6\Documents\新增資料夾\RomFS (1).img')   # the new dump's image: its size and index go into romfs.id
+DUMP = Path(r'C:\Users\john6\Documents\新增資料夾')   # the new dump: its RomFS image's size and index go into romfs.id
+ROMFS = next((p for p in sorted(DUMP.glob('*.img')) if p.name.lower().startswith('romfs')), DUMP / 'RomFS.img')
 WORK = Path(r'C:\OOT\a12work')
 MAIN_WIN = Path(r'D:\nxw\win')   # the main checkout: toolchain.json (absolute paths), the iPhoneOS SDK, zstd
 
@@ -24,7 +25,7 @@ def die(msg): t(f'FAIL: {msg}'); sys.exit(1)
 
 
 def main():
-    t(f'tree {REPO}'); t(f'A12 IPA {SRC_IPA}'); t(f'output {OUT}')
+    t(f'tree {REPO}'); t(f'A12 IPA {SRC_IPA}'); t(f'game files (identity) {ROMFS}'); t(f'output {OUT}')
     for p in (SRC_IPA, EXEFS / 'main', ROMFS):
         if not p.exists(): die(f'missing {p}')
     free = shutil.disk_usage(OUT.parent).free / 2**30
