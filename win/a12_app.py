@@ -17,8 +17,8 @@ SRC_IPA = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r'C:\OOT\OcarinaOfTim
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(r'C:\OOT\OoT-A12-fix.ipa')
 EXEFS = Path(r'C:\Games\OoT\build\extract\v131072\ExeFS')
 ICON = EXEFS.parent / 'icon.jpg'
-DUMP = Path(r'C:\Users\john6\Documents\新增資料夾')   # the new dump: its RomFS image's size and index go into romfs.id
-ROMFS = next((p for p in sorted(DUMP.glob('*.img')) if p.name.lower().startswith('romfs')), DUMP / 'RomFS.img')
+DUMPS = [Path(r'C:\OOT-A12'), Path(r'C:\Users\john6\Documents\新增資料夾')]   # the new dump: its RomFS image's size and index go into romfs.id
+ROMFS = next((p for d in DUMPS for p in sorted(d.glob('*.img')) if p.name.lower().startswith('romfs')), DUMPS[0] / 'RomFS.img')
 WORK = Path(r'C:\OOT\a12work')
 MAIN_WIN = Path(r'D:\nxw\win')   # the main checkout: toolchain.json (absolute paths), the iPhoneOS SDK, zstd
 
