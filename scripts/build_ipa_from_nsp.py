@@ -369,7 +369,7 @@ def run(cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True):
     tail = collections.deque(maxlen=40)
     p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1)
     try:
-        with open(log, 'w') as f:
+        with open(log, 'w', encoding='utf-8', errors='replace') as f:
             for line in p.stdout:
                 f.write(line); tail.append(line)
                 if on_line:
@@ -2148,7 +2148,7 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
         PROG.set(step='building the Mac host for the game\'s Oodle decoder'); env = dict(env, **oodle())
         host = Path(env['DM_OODLE_HOST'])
         inputs += [('decoder', decoder_host_key(host) or fingerprint(('files', [host]))), ('modules', package_key(Path(env['DM_OODLE_MODULES'])))]
-    key = None if ALLOW_DAMAGED else fingerprint(*inputs, *split_profile_inputs(g))
+    key = fingerprint(*inputs, *split_profile_inputs(g), ('damaged', 1) if ALLOW_DAMAGED else ('damaged', 0))   # --allow-damaged reuses its split (switch2 67f64984)
     dlckf, dlckey = pkg.with_name(pkg.name + '.dlc.key'), None
     cskf, cskey, promoted = pkg.with_name(pkg.name + '.compute.key'), None, None
     def promote(derive, kind):
