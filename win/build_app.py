@@ -316,9 +316,10 @@ def main():
         if not shader_lib.has_library(msl_ios / msldir): die(f'no iOS shader libraries {msl_ios}/{msldir}')   # the folder b-<chain>, or the one file b-<chain>.img (dm/tools/shader_lib.py)
         inputs = py(DM / 'gfx/tools/dmsh_chain.py', '--inputs', env=dict(env, DM_GAME=game))
         stamp = shader_lib.read_stamp(msl_ios / msldir)   # inputs.tsv, from the folder or the image
-        if stamp.get('game', '').strip() != game or stamp.get('inputs', '').strip() != inputs: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
+        if env.get('NXW_TRUST_MSL') == '1': t(f'shader libraries taken as they are (NXW_TRUST_MSL=1): stamp {dict(stamp)}, this tree\'s inputs {inputs}')
+        elif stamp.get('game', '').strip() != game or stamp.get('inputs', '').strip() != inputs: die(f'the iOS shader libraries {msl_ios}/{msldir} are not a full build from this profile\'s current tables (inputs {inputs})')
         c1 = gd / 'c1_full.tsv'
-        if not (c1.exists() and c1.read_text(encoding='utf-8').splitlines()[:1] and c1.read_text(encoding='utf-8').splitlines()[0].startswith(f'# chain b-{v} inputs {inputs} ')):
+        if env.get('NXW_TRUST_MSL') != '1' and not (c1.exists() and c1.read_text(encoding='utf-8').splitlines()[:1] and c1.read_text(encoding='utf-8').splitlines()[0].startswith(f'# chain b-{v} inputs {inputs} ')):
             die(f'{c1} is missing or not made from these libraries (chain {v}, inputs {inputs})')
 
     sdk = tc.ios_sdk() or die('no iPhoneOS SDK: set NXW_IOS_SDK (win/sdk/extract_xip.py extracts it from Xcode.xip)')
