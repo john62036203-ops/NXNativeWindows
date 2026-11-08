@@ -15300,7 +15300,7 @@ enum { NDVE_GAME, NDVE_METALFX, NDVE_OFF };
 static int g_ndve_armed, g_ndve_failed, g_ndve_last = -1; static id<MTLTexture> g_ndve_in; static uint64_t g_ndve_n, g_ndve_skipped;
 static int ndve_mode(void) {
     const char *e = getenv("DM_NDVE");
-    int m = e && !strcmp(e, "metalfx") ? NDVE_METALFX : e && !strcmp(e, "off") ? NDVE_OFF : NDVE_GAME;   // a12-ios: the game's network by default (the MetalFX route froze the title movie on an iPhone 16 Pro Max); DM_NDVE=metalfx / off still choose
+    int m = e && !strcmp(e, "metalfx") ? NDVE_METALFX : e && !strcmp(e, "game") ? NDVE_GAME : NDVE_OFF;   // a12-ios: a bilinear draw by default (on an iPhone 16 Pro Max MetalFX froze the title movie and the game's network hung at the title); DM_NDVE=metalfx / game still choose
     static int fx = -1; if (fx < 0) fx = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev];
     if (m == NDVE_METALFX && !fx) m = NDVE_GAME;
     if (m != g_ndve_last) { MLOG("movie NDVE (DM_NDVE=%s): %s", e ? e : "", m == NDVE_METALFX ? "MetalFX spatial scaler" : m == NDVE_OFF ? "bilinear draw" : "the game's network"); g_ndve_last = m; }

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # A12 app-only rebuild (a12-ios branch): cheemu21's A12 IPA keeps its shader libraries (compiled on a Mac, Apple metal 32023.922);
 # only the app (the host, the launcher, the rewritten modules) is built again from this tree, which differs from tag a12 in:
-#   - DM_NDVE defaults to the game's network (the MetalFX route froze the title movie on an iPhone 16 Pro Max: decoder held 12 pictures, 0 fps)
+#   - DM_NDVE defaults to off, a bilinear draw (MetalFX froze the title movie on an iPhone 16 Pro Max: decoder held 12 pictures, 0 fps; the game's network hung at the title)
 #   - win/ (the Windows toolchain) taken from john62036203-ops/NXNativeWindows switch2
 # Usage: python win\a12_app.py [A12.ipa] [out.ipa]
 import os, shutil, subprocess, sys, time, zipfile
+for _s in (sys.stdout, sys.stderr):
+    try: _s.reconfigure(encoding='utf-8', errors='replace')   # the batch file redirects to a log: cp1252 cannot write the dump folder's name
+    except Exception: pass
 from pathlib import Path
 
 WIN = Path(__file__).resolve().parent
