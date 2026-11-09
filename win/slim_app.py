@@ -94,6 +94,16 @@ def main():
             n = f'Payload/DmIOS.app/dm/{f}'
             if n in names: (gd / f).write_bytes(z.read(n)); t(f'{f} from OoT-slim.ipa')
             else: t(f'[warn] {f} not in OoT-slim.ipa')
+    # The pipelines met in play on the phone (its Documents/pso_user.tsv, copied into the tree as pso_user_seed.tsv) join the shipped prewarm list: a fresh install prepares them at the start
+    # instead of compiling each at its first draw (1-3 s stalls a batch). Same rows (S / R / C / M), duplicates dropped
+    seed = gd / 'pso_user_seed.tsv'; man = gd / 'pso_manifest.tsv'
+    if seed.exists() and man.exists():
+        have = set(l.rstrip('\n') for l in man.read_text(encoding='utf-8').splitlines() if l and not l.startswith('#'))
+        add = [l.rstrip('\n') for l in seed.read_text(encoding='utf-8').splitlines() if l and not l.startswith('#') and l.rstrip('\n') not in have]
+        add = list(dict.fromkeys(add))
+        if add:
+            with open(man, 'a', encoding='utf-8', newline='\n') as f: f.write('\n'.join(add) + '\n')
+        t(f'pso_manifest.tsv: {len(add)} rows added from pso_user_seed.tsv ({len(have)} were there)')
     chain = Path(img).stem
     hdr = (REPO / 'dm/gfx/nvn/dmsh_chain.h').read_text(encoding='utf-8')
     if f'"{chain[2:]}"' not in hdr: die(f'the IPA\'s shader image {chain} is not this tree\'s chain ({hdr.strip().splitlines()[-1]})')
