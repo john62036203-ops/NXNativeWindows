@@ -1470,7 +1470,9 @@ void mtl_sub_begin(void) {
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
     for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
-    if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
+    // DM_NVN_ALLOC_MAX (default ALLOC_MAX): fewer allocators to test whether running up to 32 submissions ahead of the GPU is what leaves the GPU idle between Ocarina of Time's tiny submissions (log 28674f05: 83 encoders doing 7 ms of work spread over 53 ms, allocator waits 45 ms a frame)
+    static int alloc_max = -1; if (alloc_max < 0) { const char *e = getenv("DM_NVN_ALLOC_MAX"); alloc_max = e && atoi(e) > 0 && atoi(e) <= ALLOC_MAX ? atoi(e) : ALLOC_MAX; if (alloc_max != ALLOC_MAX) MLOG("command allocators capped at %d (DM_NVN_ALLOC_MAX)", alloc_max); }
+    if (alloc_i < 0 && g_alloc_n < alloc_max) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("failed to create a new MTL4CommandAllocator: %s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
