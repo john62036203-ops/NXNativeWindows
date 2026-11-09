@@ -4756,16 +4756,11 @@ enum { POOL_HEAP_GRAIN = 64 << 10 };
 - (void)dealloc { free(used); }
 @end
 static nvn_hmap g_pool_heap = {.klen = sizeof(pool_heap_key)};   // (pool, window) → NvPoolHeap (retained), under g_smu; dropped with the pool (mtl_alias_drop_pool)
-// DM_NVN_POOL_HEAP_WIN_MB (default 64 on iOS, 0 = one heap per pool as before): a pool's heap memory is made in windows of this size of its scaled range, each only when a render target
+// DM_NVN_POOL_HEAP_WIN_MB (default 0 = one heap per pool as before): a pool's heap memory is made in windows of this size of its scaled range, each only when a render target
 // lands in it. A placement heap is allocated whole: Ocarina of Time's 11 GPU-only pools made 2,080 MB of heaps for 11 render targets at a render scale of 0.25 on an iPhone 16 Pro Max (8 GB),
 // 40% of the 5,461 MB working set, and the residency set reached it in a large area (GPU out of memory, log 9f57d842). Ranges apart in the pool stay apart (different windows or offsets);
 // a texture whose scaled range crosses a window boundary keeps an allocation of its own, as one that does not fit its range does
-static uint64_t pool_heap_win(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_WIN_MB");
-#if TARGET_OS_IPHONE
-    v = e ? atoll(e) : 64;
-#else
-    v = e ? atoll(e) : 0;
-#endif
+static uint64_t pool_heap_win(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_WIN_MB"); v = e ? atoll(e) : 0;   // opt-in until measured alone: its first run (f2f0a75c) also had gmem_nobig's commit cost
     v <<= 20; if (v) MLOG("GPU-only pool heaps in windows of %lld MB (DM_NVN_POOL_HEAP_WIN_MB)", (long long)(v >> 20)); } return (uint64_t)v; }
 static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_POOL_HEAP"); on = !e || atoi(e); }
@@ -10555,16 +10550,13 @@ static id<MTLBuffer> gmem_map(void) {
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
-    // DM_NVN_GMEM_NOBIG (default 1 on iOS, 0 on the Mac; cheemu21's kid-with-sword-remake gmem_nobig): a large pool (BIG_MIN) is not mapped whole for the table; it is listed by the chunks lookups
+    // DM_NVN_GMEM_NOBIG (default 0; cheemu21's kid-with-sword-remake gmem_nobig): a large pool (BIG_MIN) is not mapped whole for the table; it is listed by the chunks lookups
     // made and made resident, so only what the GPU reaches through bindings and pointer sites is wired. Mapping Ocarina of Time's 2,432 MB main pool whole at the first raw-access shader (the title
     // movie's dispatch) made one residency commit wire 2.4 GB of file-backed guest memory at once; on an iPhone 16 Pro Max (8 GB) that commit sat in the kernel (IOGPUResourceGroupUpdateResources)
     // and never came back in 2 of 6 starts: the picture stopped at the title movie while the audio went on (logs aa12734d, 929da398). A raw read into a part of such a pool nothing has bound reads 0
-    static int nobig = -1; if (nobig < 0) { const char *e = getenv("DM_NVN_GMEM_NOBIG");
-#if TARGET_OS_IPHONE
-        nobig = !e || atoi(e) != 0;
-#else
-        nobig = e && atoi(e) != 0;
-#endif
+    // Off by default again (DM_NVN_GMEM_NOBIG=1 turns it on): it did not stop the hang (log a9c847bd, the same kernel call), and with the main pool listed in chunks every residency commit
+    // re-wired hundreds of MB: 2-7.5 ms a commit against 0.15-0.45 ms with the pool wired whole (logs 611b0303, f2f0a75c against 13a11e95, 69062483); the game fell from 30 to 5 fps
+    static int nobig = -1; if (nobig < 0) { const char *e = getenv("DM_NVN_GMEM_NOBIG"); nobig = e && atoi(e) != 0;
         if (nobig) MLOG("raw global memory: large pools are listed by their resident chunks, never wired whole (gmem_nobig; DM_NVN_GMEM_NOBIG=0 wires them whole)"); }
     pthread_mutex_lock(&g_mu);
     if (!nobig) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
