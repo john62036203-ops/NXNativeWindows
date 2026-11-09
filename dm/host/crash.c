@@ -41,7 +41,8 @@ void crash_watch_progress(uint32_t tick, const char *stage) {
     atomic_fetch_add(&g_watch_count, 1);
     atomic_store(&g_watch_last_ns, watch_now_ns());
 }
-void crash_watch_frame(void) { if (atomic_load(&g_watch_pregame)) crash_watch_progress(0, "present frame"); }
+static _Atomic uint32_t g_watch_frames;   // frames presented so far: a front-end stall (the title movie) is dumped too once one has been shown
+void crash_watch_frame(void) { atomic_fetch_add(&g_watch_frames, 1); if (atomic_load(&g_watch_pregame)) crash_watch_progress(0, "present frame"); }
 void crash_watch_pregame_done(void) { atomic_store(&g_watch_pregame, 0); }
 void crash_watch_pregame_again(void) { atomic_store(&g_watch_pregame, 1); }   // Back from a run to the front end: count progress by presented frames again (diag.c)
 void crash_dump_now(const char *why);
@@ -80,7 +81,7 @@ static void *watchdog_main(void *arg) {
         // DM_WATCH_DUMP_MS (default 1000) / DM_WATCH_DUMPS (default 3): a shorter stall to dump and more dumps, for a run whose frames take 200-800 ms (Ocarina of Time at 7 fps: no frame reached 1 s, so the log had no thread states)
         { static int dumps, max_dumps = -1; static uint64_t last_dump, dumped_for, dump_ns;
           if (max_dumps < 0) { const char *e = getenv("DM_WATCH_DUMPS"), *m = getenv("DM_WATCH_DUMP_MS"); max_dumps = e && atoi(e) > 0 ? atoi(e) : 3; dump_ns = (uint64_t)(m && atoi(m) > 0 ? atoi(m) : 1000) * 1000000ull; }
-          if (g_watch_stall && !atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0 && now - last >= dump_ns && now - last < (uint64_t)g_watch_stall * 1000000000ull
+          if (g_watch_stall && ((!atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0) || (atomic_load(&g_watch_pregame) && atomic_load(&g_watch_frames) > 0)) && now - last >= dump_ns && now - last < (uint64_t)g_watch_stall * 1000000000ull
               && dumps < max_dumps && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; char why[96]; snprintf(why, sizeof why, "progress stalled for over %llu ms", (unsigned long long)(dump_ns / 1000000ull)); crash_dump_now(why); } }
         if (g_watch_stall && now - last >= (uint64_t)g_watch_stall * 1000000000ull) {
             uint64_t sec = (now - last) / 1000000000ull;
