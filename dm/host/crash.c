@@ -41,7 +41,8 @@ void crash_watch_progress(uint32_t tick, const char *stage) {
     atomic_fetch_add(&g_watch_count, 1);
     atomic_store(&g_watch_last_ns, watch_now_ns());
 }
-void crash_watch_frame(void) { if (atomic_load(&g_watch_pregame)) crash_watch_progress(0, "present frame"); }
+static _Atomic uint32_t g_watch_frames;   // frames presented so far: a front-end stall (the title movie) is dumped too once one has been shown
+void crash_watch_frame(void) { atomic_fetch_add(&g_watch_frames, 1); if (atomic_load(&g_watch_pregame)) crash_watch_progress(0, "present frame"); }
 void crash_watch_pregame_done(void) { atomic_store(&g_watch_pregame, 0); }
 void crash_watch_pregame_again(void) { atomic_store(&g_watch_pregame, 1); }   // Back from a run to the front end: count progress by presented frames again (diag.c)
 void crash_dump_now(const char *why);
@@ -78,7 +79,7 @@ static void *watchdog_main(void *arg) {
         // Second-scale stall (progress has stopped for more than 1 second but has not yet reached the kill threshold): do not exit, dump what each thread is waiting on. When hitting a case of "only one frame every 2 seconds", the 15-second threshold cannot catch it and the log has nothing on what it is waiting for.
         // Dump only after entering a run; at most 3 dumps per process, at least 10 seconds between two dumps (the loading screen and the pause menu also stop ticks, do not let them flood the log)
         { static int dumps; static uint64_t last_dump, dumped_for;
-          if (g_watch_stall && !atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0 && now - last >= 1000000000ull && now - last < (uint64_t)g_watch_stall * 1000000000ull
+          if (g_watch_stall && ((!atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0) || (atomic_load(&g_watch_pregame) && atomic_load(&g_watch_frames) > 0)) && now - last >= 1000000000ull && now - last < (uint64_t)g_watch_stall * 1000000000ull
               && dumps < 3 && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; crash_dump_now("progress stalled for over 1 second"); } }
         if (g_watch_stall && now - last >= (uint64_t)g_watch_stall * 1000000000ull) {
             uint64_t sec = (now - last) / 1000000000ull;

@@ -410,10 +410,9 @@ def main():
     split = env.get('NXW_SPLIT_DATA', '')
     maps = [f'Payload/DmIOS.app={app}']
     if pso: maps.append(f'Payload/DmIOS.app/pso={pso}')
-    # The pulling vertex libraries (<key>_bp) serve the hybrid pipelines: packed when the profile compiles pso_mtl4 in (DM_GAME_PSO_MTL4), or IOS_PULL=1, and always with an archive (build_ipa.sh)
-    m = re.search(r'^#define DM_GAME_PSO_MTL4 (\d)', (gen / 'profile/game_profile.h').read_text(encoding='utf-8'), re.M)
-    pull = env.get('IOS_PULL') or (m.group(1) if m else '0')
-    skip_bp = not pso and pull != '1'
+    # The pulling vertex libraries (<key>_bp) serve the hybrid pipelines: packed unless IOS_PULL=0, and always with an archive (build_ipa.sh since upstream 7a7acfee: the launcher's
+    # Metal 4 pipelines toggle turns the path on for any game, whatever the profile's pso_mtl4)
+    skip_bp = not pso and env.get('IOS_PULL') == '0'
     if split and split != '0':
         # Split build: the IPA holds only the app (small, quick to sign and install); the game files and shader libraries go to a data folder the player copies
         # into the app's Documents (dm/ios/Sources/main.m looks for <Documents>/romfs and <Documents>/<folder>/romfs, and takes msl/ and aoc/ beside it)
