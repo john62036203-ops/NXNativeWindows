@@ -2625,6 +2625,7 @@ static void retire_resume(const void *o) {   // the last serial entry holding a 
 // Also, when a pool object's address is reused, old entries would hand a texture on the old storage to the new pool's texture at the same offset and description. Evicted textures go through deferred release; if the serial table still holds one, that is just one more reference
 static void treg_drop_pool_views(const void *pool);
 static void cpu_tex_drop_pool(const void *pool);
+typedef struct { const void *pool; uint64_t win; } pool_heap_key;   // a pool and a window of its scaled range (pool_heap_win), win 0 and a whole-pool heap when windows are off
 static nvn_hmap g_pool_heap;   // GPU-only pools' placement heaps (pool_heap_texture, below)
 static void gws_drop_pool(const pool_t *p);
 void mtl_alias_drop_pool(const void *pool) {
@@ -2636,7 +2637,11 @@ void mtl_alias_drop_pool(const void *pool) {
             if (k.pool == (uint64_t)(uintptr_t)pool) { alias_key *nk = realloc(ks, (ns + 1) * sizeof *ks); if (!nk) break; ks = nk; ks[ns++] = k; } }
         for (uint32_t i = 0; i < ns; i++) hm_del_id(&g_pkg_share, &ks[i]);
         free(ks); }
-    { void *h = nvn_hm_del(&g_pool_heap, &pool); if (h) CFRelease(h); }   // the pool's placement heap goes when its last texture does (each holds it)
+    { uint32_t nk = 0; pool_heap_key *hks = NULL;   // the pool's placement heaps (one, or one per window) go when their last texture does (each holds its heap)
+        for (uint32_t i = 0; i < g_pool_heap.cap; i++) { if (!g_pool_heap.vals[i]) continue; pool_heap_key k; memcpy(&k, g_pool_heap.keys + (size_t)i * g_pool_heap.klen, sizeof k);
+            if (k.pool == pool) { pool_heap_key *n2 = realloc(hks, (nk + 1) * sizeof *hks); if (!n2) break; hks = n2; hks[nk++] = k; } }
+        for (uint32_t i = 0; i < nk; i++) { void *h = nvn_hm_del(&g_pool_heap, &hks[i]); if (h) CFRelease(h); }
+        free(hks); }
     uint32_t n = 0; alias_key *ks = NULL;
     for (uint32_t i = 0; i < g_alias.cap; i++) {
         if (!g_alias.vals[i]) continue;
@@ -4748,7 +4753,18 @@ enum { POOL_HEAP_GRAIN = 64 << 10 };
 @implementation NvPoolHeap
 - (void)dealloc { free(used); }
 @end
-static nvn_hmap g_pool_heap = {.klen = sizeof(void *)};   // pool object → NvPoolHeap (retained), under g_smu; dropped with the pool (mtl_alias_drop_pool)
+static nvn_hmap g_pool_heap = {.klen = sizeof(pool_heap_key)};   // (pool, window) → NvPoolHeap (retained), under g_smu; dropped with the pool (mtl_alias_drop_pool)
+// DM_NVN_POOL_HEAP_WIN_MB (default 64 on iOS, 0 = one heap per pool as before): a pool's heap memory is made in windows of this size of its scaled range, each only when a render target
+// lands in it. A placement heap is allocated whole: Ocarina of Time's 11 GPU-only pools made 2,080 MB of heaps for 11 render targets at a render scale of 0.25 on an iPhone 16 Pro Max (8 GB),
+// 40% of the 5,461 MB working set, and the residency set reached it in a large area (GPU out of memory, log 9f57d842). Ranges apart in the pool stay apart (different windows or offsets);
+// a texture whose scaled range crosses a window boundary keeps an allocation of its own, as one that does not fit its range does
+static uint64_t pool_heap_win(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_WIN_MB");
+#if TARGET_OS_IPHONE
+    v = e ? atoll(e) : 64;
+#else
+    v = e ? atoll(e) : 0;
+#endif
+    v <<= 20; if (v) MLOG("GPU-only pool heaps in windows of %lld MB (DM_NVN_POOL_HEAP_WIN_MB)", (long long)(v >> 20)); } return (uint64_t)v; }
 static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_POOL_HEAP"); on = !e || atoi(e); }
     const pool_t *p = t->pool;
@@ -4760,23 +4776,27 @@ static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d)
     uint64_t lo = (uint64_t)((double)t->off * POOL_HEAP_SCALE), hi = (uint64_t)((double)((uint64_t)t->off + t->L.size) * POOL_HEAP_SCALE);
     uint64_t at = (lo + need.align - 1) / need.align * need.align;
     if (at + need.size > hi) { g_pool_heap_unfit++; return nil; }
+    uint64_t win = pool_heap_win(), wbase = 0;
+    if (win) { wbase = at / win * win; if (at + need.size > wbase + win) { g_pool_heap_unfit++; return nil; } }   // the texture crosses a window boundary: its own allocation
+    pool_heap_key hk = {p, win ? wbase / win : 0};
     pthread_mutex_lock(&g_smu);
-    NvPoolHeap *h = (__bridge NvPoolHeap *)nvn_hm_get(&g_pool_heap, &p);
+    NvPoolHeap *h = (__bridge NvPoolHeap *)nvn_hm_get(&g_pool_heap, &hk);
     if (!h) {
-        uint64_t size = ((uint64_t)((double)p->size * POOL_HEAP_SCALE) + need.align + POOL_HEAP_GRAIN - 1) / POOL_HEAP_GRAIN * POOL_HEAP_GRAIN;
+        uint64_t size = win ? win : ((uint64_t)((double)p->size * POOL_HEAP_SCALE) + need.align + POOL_HEAP_GRAIN - 1) / POOL_HEAP_GRAIN * POOL_HEAP_GRAIN;
         MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = size;
         hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = d.hazardTrackingMode;
         id<MTLHeap> heap = [g_dev newHeapWithDescriptor:hd];
         if (heap) { h = [NvPoolHeap new]; h->heap = heap; h->ngrain = size / POOL_HEAP_GRAIN; h->used = calloc(h->ngrain, 1);
-            atomic_fetch_add(&g_image_heap_n, 1); nvn_hm_put(&g_pool_heap, &p, (void *)CFBridgingRetain(h)); g_pool_heap_n++; g_pool_heap_bytes += size;
-            static int nl; if (nl++ < 8) MLOG("GPU-only pool %p (%llu MB): its render targets share one placement heap of %llu MB", p->mem, (unsigned long long)(p->size >> 20), (unsigned long long)(size >> 20)); }
+            atomic_fetch_add(&g_image_heap_n, 1); nvn_hm_put(&g_pool_heap, &hk, (void *)CFBridgingRetain(h)); g_pool_heap_n++; g_pool_heap_bytes += size;
+            static int nl; if (nl++ < 8) MLOG("GPU-only pool %p (%llu MB): its render targets share %s placement heap of %llu MB", p->mem, (unsigned long long)(p->size >> 20), win ? "a window's" : "one", (unsigned long long)(size >> 20)); }
     }
     pthread_mutex_unlock(&g_smu);
-    if (!h || at + need.size > h->heap.size) return nil;
-    id<MTLTexture> mt = [h->heap newTextureWithDescriptor:d offset:at]; if (!mt) return nil;
+    uint64_t hat = at - wbase;   // the offset in this heap (the window's base taken off)
+    if (!h || hat + need.size > h->heap.size) return nil;
+    id<MTLTexture> mt = [h->heap newTextureWithDescriptor:d offset:hat]; if (!mt) return nil;
     objc_setAssociatedObject(mt, &g_image_heap_owner_key, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     res_add(mt); g_pool_heap_tex++;
-    size_t g0 = at / POOL_HEAP_GRAIN, g1 = MIN((at + need.size - 1) / POOL_HEAP_GRAIN, h->ngrain - 1); int all_new = 1;
+    size_t g0 = hat / POOL_HEAP_GRAIN, g1 = MIN((hat + need.size - 1) / POOL_HEAP_GRAIN, h->ngrain - 1); int all_new = 1;
     for (size_t g = g0; g <= g1; g++) { if (h->used[g]) all_new = 0; h->used[g] = 1; }
     if (all_new && !tex_init_fill(t, mt, 0)) tex_zero_fill(mt);
     return mt;
