@@ -5020,8 +5020,9 @@ static void pool_unwire(uint64_t frame) { @autoreleasepool {
     MLOG("pool unwire at frame %llu: %d pools (%llu MB) idle for %lld s left the residency set; kept %d the pool table lists and %d under live textures; in all %llu left (%llu MB), %llu came back at a lookup",
          (unsigned long long)frame, n, (unsigned long long)(bytes >> 20), (long long)idle_s, kept_raw, kept_tex, (unsigned long long)g_pool_unwired, (unsigned long long)g_pool_unwired_mb, (unsigned long long)g_pool_rewired);
 } }
+static void tex_cold_retire(uint64_t frame);
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
-    pool_unwire(frame);
+    pool_unwire(frame); tex_cold_retire(frame);
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
@@ -6888,6 +6889,53 @@ void mtl_reg_tex_gone(int tid) {
     if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) treg_gone(&g_treg[tid]);
     os_unfair_lock_unlock(&g_rmu);
 }
+// Cold textures (DM_NVN_TEX_COLD_S, seconds; default 0 = off): a registered texture no shader has read through a pool for that long is retired although a live object still
+// holds it. The pools' read bitmap (pool_seen) tells which IDs the GPU read, but it only accumulated: here, every 300 frames, the IDs set since the last sweep are stamped with the
+// frame and the GPU's words are cleared, so a shader's next read of an ID sets its bit again (dm_pool_mark sets a clear bit) and the stamps say what was read in the last sweep period.
+// A texture whose IDs were all stamped before the cold time is dropped: its registrations' views, its serial's texture and its sharing entry go (deferred until the GPU is done with
+// them), its seen bits are cleared and its IDs are noted for the tables (reg_bump), so pool_entry gives the dummy until a shader reads the ID again, which sets the bit, and
+// pool_seen_scan's fresh path makes the texture again from its storage (tex_init_fill), as for a texture read the first time. Kept: render targets, buffer-backed (linear / buffer)
+// textures, CPU-written (packaged) ones, IDs never read (made by the budget or a direct bind: those are re-made at once anyway) and anything read in the cold time.
+// Ocarina of Time on an 8 GB iPhone held 1,750 private textures (1.5 GB) by the Kokiri Forest, most of them the title's and the earlier scenes', with 4,300 pools (2.2 GB) beside
+// them; iOS then paged the file-backed guest memory at 150 MB/s and the frame went from 33 to 50-400 ms (logs 1c3b8ff7, de112926). The idle retirement above (alias_retire_idle,
+// DM_NVN_WS_MB) reaches only textures no live object holds: 232 MB of them (log de112926)
+static uint32_t *g_seen_at; static uint64_t g_cold_retired, g_cold_retired_mb, g_cold_sweeps;
+static void tex_cold_retire(uint64_t frame) { @autoreleasepool {
+    static int64_t cold_s = -1; if (cold_s < 0) { const char *e = getenv("DM_NVN_TEX_COLD_S"); cold_s = e ? atoll(e) : 0; if (cold_s > 0) MLOG("textures no shader read for %lld s are retired until their next read (DM_NVN_TEX_COLD_S)", (long long)cold_s); }
+    if (cold_s <= 0 || !g_seen_buf) return;
+    if (!g_seen_at) { g_seen_at = calloc(POOL_SEEN_WORDS * 32, sizeof *g_seen_at); if (!g_seen_at) return; }
+    uint64_t cold_frames = (uint64_t)cold_s * 30; if (frame < cold_frames) frame = cold_frames;
+    uint32_t stamp = (uint32_t)frame ? (uint32_t)frame : 1;
+    typedef struct { uint64_t serial; alias_key k; int id_; } cold_t; cold_t *cs = NULL; uint32_t n = 0, cap = 0; uint64_t bytes = 0; unsigned stamped = 0, kept_rt = 0, kept_buf = 0;
+    os_unfair_lock_lock(&g_rmu);
+    g_cold_sweeps++;
+    // 1) stamp the IDs read since the last sweep and clear the GPU's words (not g_seen_done: a texture made because it was read stays made)
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_seen_buf.contents; unsigned words = MIN((unsigned)g_ntreg / 32 + 1, (unsigned)POOL_SEEN_WORDS);
+    for (unsigned i = 0; i < words; i++) { uint32_t bits = atomic_exchange(w + i, 0); for (; bits; bits &= bits - 1) { g_seen_at[i * 32 + __builtin_ctz(bits)] = stamp; stamped++; } }
+    // 2) the cold ones: read once (a stamp), not within the cold time, holding a made texture that is not a render target, not over a buffer and not CPU-written
+    for (int id_ = 1; id_ < g_ntreg; id_++) { treg_t *r = &g_treg[id_];
+        if (!r->ok || r->gone || r->retired || !r->view || r->view_pkg) continue;
+        uint32_t at = g_seen_at[id_]; if (!at || (uint64_t)at + cold_frames > frame) continue;
+        id<MTLTexture> v = (__bridge id<MTLTexture>)r->view; id<MTLTexture> base = v.parentTexture ? v.parentTexture : v;
+        if (base.usage & MTLTextureUsageRenderTarget) { kept_rt++; continue; }
+        if (base.buffer || base.storageMode != MTLStorageModePrivate) { kept_buf++; continue; }
+        if (n == cap) { cold_t *nc = realloc(cs, (cap = cap ? cap * 2 : 128) * sizeof *cs); if (!nc) break; cs = nc; }
+        cs[n++] = (cold_t){r->t.serial, tex_alias_key(&r->t), id_}; bytes += base.allocatedSize;
+        treg_drop_views(r); pool_seen_clear(id_); g_seen_at[id_] = 0; reg_bump(id_, 0);   // the tables take the ID again: pool_entry gives the dummy until a read sets its bit
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    // 3) the serials' textures and their sharing entries, outside g_rmu (serial_del takes g_smu itself; two IDs of one serial drop it once)
+    uint32_t dropped = 0;
+    for (uint32_t j = 0; j < n; j++) { int dup = 0; for (uint32_t q = 0; q < j && !dup; q++) dup = cs[q].serial == cs[j].serial; if (dup) continue;
+        serial_del(cs[j].serial); mtl_vc_drop(cs[j].serial); dropped++; }
+    if (n) { pthread_mutex_lock(&g_smu);
+        for (uint32_t j = 0; j < n; j++) { if (nvn_hm_get(&g_alias, &cs[j].k)) alias_let_go(&cs[j].k, 1); }
+        g_ser_gen++; pthread_mutex_unlock(&g_smu);
+        g_cold_retired += dropped; g_cold_retired_mb += bytes >> 20; }
+    free(cs);
+    MLOG("cold textures at frame %llu: %u IDs read in the last sweep; %u IDs (%u textures, %llu MB) not read for %lld s retired until their next read; kept %u render targets, %u over buffers; in all %llu textures (%llu MB) in %llu sweeps",
+         (unsigned long long)frame, stamped, n, dropped, (unsigned long long)(bytes >> 20), (long long)cold_s, kept_rt, kept_buf, (unsigned long long)g_cold_retired, (unsigned long long)g_cold_retired_mb, (unsigned long long)g_cold_sweeps);
+} }
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     int id_ = tid; if (id_ < 0) return;
     os_unfair_lock_lock(&g_rmu);
