@@ -78,9 +78,11 @@ static void *watchdog_main(void *arg) {
         if (last > now) continue;
         // Second-scale stall (progress has stopped for more than 1 second but has not yet reached the kill threshold): do not exit, dump what each thread is waiting on. When hitting a case of "only one frame every 2 seconds", the 15-second threshold cannot catch it and the log has nothing on what it is waiting for.
         // Dump only after entering a run; at most 3 dumps per process, at least 10 seconds between two dumps (the loading screen and the pause menu also stop ticks, do not let them flood the log)
-        { static int dumps; static uint64_t last_dump, dumped_for;
-          if (g_watch_stall && ((!atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0) || (atomic_load(&g_watch_pregame) && atomic_load(&g_watch_frames) > 0)) && now - last >= 1000000000ull && now - last < (uint64_t)g_watch_stall * 1000000000ull
-              && dumps < 3 && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; crash_dump_now("progress stalled for over 1 second"); } }
+        // DM_WATCH_DUMP_MS (default 1000) / DM_WATCH_DUMPS (default 3): a shorter stall to dump and more dumps, for a run whose frames take 200-800 ms (Ocarina of Time at 7 fps: no frame reached 1 s, so the log had no thread states)
+        { static int dumps, max_dumps = -1; static uint64_t last_dump, dumped_for, dump_ns;
+          if (max_dumps < 0) { const char *e = getenv("DM_WATCH_DUMPS"), *m = getenv("DM_WATCH_DUMP_MS"); max_dumps = e && atoi(e) > 0 ? atoi(e) : 3; dump_ns = (uint64_t)(m && atoi(m) > 0 ? atoi(m) : 1000) * 1000000ull; }
+          if (g_watch_stall && ((!atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0) || (atomic_load(&g_watch_pregame) && atomic_load(&g_watch_frames) > 0)) && now - last >= dump_ns && now - last < (uint64_t)g_watch_stall * 1000000000ull
+              && dumps < max_dumps && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; char why[96]; snprintf(why, sizeof why, "progress stalled for over %llu ms", (unsigned long long)(dump_ns / 1000000ull)); crash_dump_now(why); } }
         if (g_watch_stall && now - last >= (uint64_t)g_watch_stall * 1000000000ull) {
             uint64_t sec = (now - last) / 1000000000ull;
             int idx = atomic_load(&g_watch_stage_idx);
