@@ -4752,16 +4752,11 @@ enum { POOL_HEAP_GRAIN = 64 << 10 };
 - (void)dealloc { free(used); }
 @end
 static nvn_hmap g_pool_heap = {.klen = sizeof(pool_heap_key)};   // (pool, window) → NvPoolHeap (retained), under g_smu; dropped with the pool (mtl_alias_drop_pool)
-// DM_NVN_POOL_HEAP_WIN_MB (default 64 on iOS, 0 = one heap per pool as before): a pool's heap memory is made in windows of this size of its scaled range, each only when a render target
+// DM_NVN_POOL_HEAP_WIN_MB (default 0 = one heap per pool as before; 64 to try): a pool's heap memory is made in windows of this size of its scaled range, each only when a render target
 // lands in it. A placement heap is allocated whole: Ocarina of Time's 11 GPU-only pools made 2,080 MB of heaps for 11 render targets at a render scale of 0.25 on an iPhone 16 Pro Max (8 GB),
 // 40% of the 5,461 MB working set, and the residency set reached it in a large area (GPU out of memory, log 9f57d842). Ranges apart in the pool stay apart (different windows or offsets);
 // a texture whose scaled range crosses a window boundary keeps an allocation of its own, as one that does not fit its range does
-static uint64_t pool_heap_win(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_WIN_MB");
-#if TARGET_OS_IPHONE
-    v = e ? atoll(e) : 64;
-#else
-    v = e ? atoll(e) : 0;
-#endif
+static uint64_t pool_heap_win(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_HEAP_WIN_MB"); v = e ? atoll(e) : 0;   // opt-in on slim-x4 (DM_NVN_POOL_HEAP_WIN_MB=64) until a run of its own shows it helps
     v <<= 20; if (v) MLOG("GPU-only pool heaps in windows of %lld MB (DM_NVN_POOL_HEAP_WIN_MB)", (long long)(v >> 20)); } return (uint64_t)v; }
 static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_POOL_HEAP"); on = !e || atoi(e); }
