@@ -11,9 +11,6 @@ name	The Legend of Zelda: Ocarina of Time
 ipa	ZeldaOcarinaOfTime.ipa
 app_category	public.app-category.adventure-games
 # cheemu21 V17's steady 30 on the iPhone: frame buffering on, the display link's latency 2 at the 30 fps cap (a 34-38 ms frame is absorbed), no payback steps (a late frame's time is let go)
-present_snap	on
-link_latency30	2
-fps_payback	off
 pad_layout	native
 # The touch controls' Forest colours (cheemu21 kid-with-sword-remake V17; the launcher's Touch controls style can switch back to Classic)
 pad_theme	forest
