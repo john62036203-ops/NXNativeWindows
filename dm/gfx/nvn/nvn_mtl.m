@@ -637,12 +637,14 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; } pool_ent;   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; uint64_t used; uint8_t unwired; } pool_ent;   // used: the frame of its last lookup through mtl_addr / mtl_gpu_addr (pool_unwire)   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
 static uint64_t g_pool_adds;
 static int g_pool_res_n;   // registered pools already in the residency set (for the memory readout; under g_mu)
+static uint64_t g_pool_unwired, g_pool_unwired_mb, g_pool_rewired, g_pool_sweeps;   // pool_unwire: pools let go of as idle, their MB, those a lookup put back, sweeps (under g_mu)
+static _Atomic uint64_t g_cur_frame;   // the frame being submitted (nvn_mtl's frame counter, defined with the statistics below)
 static __thread int t_tex_upload_lookup;   // set around a texture upload's read of its storage (pool lookups counted apart, mem_census)
 
 #define C1_BANK_SIZE (4u << 20)
@@ -900,7 +902,7 @@ void mtl_pool_addressed(const void *mem, uint64_t size) {
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
 static void pool_res(int i) {
     if (g_pools[i].res) return;
-    res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
+    res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++; g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (g_pools[i].unwired) { g_pools[i].unwired = 0; g_pool_rewired++; }
 }
 // A large pool in chunks. Metal wires a zero-copy buffer whole while it is in the residency set, so one buffer over a large pool pins all of it, whatever the GPU reads. Mario Kart World's 2,427 MB
 // graphics pool: the GPU has touched 1,111 MB by the first race, 326 MB of it in the last 1,500 frames; on a 16 GB Mac the driver then spent half its time wiring and unwiring (3.2 s of a 6 s Metal System
@@ -1053,7 +1055,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
     if (i >= 0) { if (t_tex_upload_lookup) g_pools[i].n_tex_reads++; else g_pools[i].n_other++; }
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
+    if (i >= 0) { pool_res(i); g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
@@ -1064,7 +1066,7 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
     if (i >= 0) { if (t_tex_upload_lookup) g_pools[i].n_tex_reads++; else g_pools[i].n_other++; }
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
+    if (i >= 0) { pool_res(i); g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
@@ -1571,7 +1573,7 @@ static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static
 static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also ends the upload / diagnostics / present encoders, which may end while a profiled pass is open (#531)
 static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
 static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
-static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+static uint64_t g_stat_pass, g_stat_draw; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
@@ -4987,7 +4989,37 @@ static uint64_t g_gptr_sites, g_gptr_filled, g_gptr_draws, g_gptr_short;   // bi
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
+// Idle memory pools leave the residency set (DM_NVN_POOL_UNWIRE_S, seconds idle; default 0 = off). A pool goes into the set the first time the GPU gets its address (pool_res) and
+// stayed there until the game freed it: Ocarina of Time addresses 4,300 pools and chunks (2.1 GB) by the Kokiri Forest and frees few, so with 1.4 GB of textures and the process's
+// own 3 GB an 8 GB iPhone ran out of memory for the file-backed guest pages, paged 150 MB/s back in and the frame went from 33 to 50-400 ms (logs 1c3b8ff7, de112926). Every sweep
+// (the 300-frame memory report) bumps g_pool_gen, so each pool's next use comes through mtl_addr / mtl_gpu_addr and records the frame; a pool not used for the idle time leaves the set
+// and comes back through pool_res at its next lookup (a commit on the spot). Kept: pools the raw-global-memory pool table lists (addr_meets: the shader reaches them without a lookup)
+// and buffers a live texture object was created over (linear and buffer textures; MTLTexture.buffer)
+static void pool_unwire(uint64_t frame) { @autoreleasepool {
+    static int64_t idle_s = -1; if (idle_s < 0) { const char *e = getenv("DM_NVN_POOL_UNWIRE_S"); idle_s = e ? atoll(e) : 0; if (idle_s > 0) MLOG("memory pools idle for %lld s leave the residency set until their next lookup (DM_NVN_POOL_UNWIRE_S)", (long long)idle_s); }
+    if (idle_s <= 0) return;
+    uint64_t idle_frames = (uint64_t)idle_s * 30;
+    CFMutableSetRef pinned = CFSetCreateMutable(NULL, 0, NULL);
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) { void *v = g_by_serial.vals[i]; if (!v) continue; id o = (__bridge id)v;
+        if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLBuffer> b = ((id<MTLTexture>)o).buffer; if (b) CFSetAddValue(pinned, (__bridge const void *)b); } }
+    pthread_mutex_unlock(&g_smu);
+    int n = 0, kept_tex = 0, kept_raw = 0; uint64_t bytes = 0;
+    pthread_mutex_lock(&g_mu);
+    g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); g_pool_sweeps++;   // the per-thread address caches and the vertex tables are invalid: every pool's next use records its frame
+    for (int i = 0; i < g_npool; i++) { pool_ent *p = &g_pools[i];
+        if (!p->res || p->used + idle_frames > frame) continue;
+        if (addr_meets(p->lo, p->hi)) { kept_raw++; continue; }
+        if (CFSetContainsValue(pinned, (__bridge const void *)p->buf)) { kept_tex++; continue; }
+        res_remove(p->buf); p->res = 0; p->unwired = 1; g_pool_res_n--; n++; bytes += p->buf.length; }
+    pthread_mutex_unlock(&g_mu);
+    CFRelease(pinned);
+    if (n) { res_commit(); pthread_mutex_lock(&g_mu); g_pool_unwired += n; g_pool_unwired_mb += bytes >> 20; pthread_mutex_unlock(&g_mu); }
+    MLOG("pool unwire at frame %llu: %d pools (%llu MB) idle for %lld s left the residency set; kept %d the pool table lists and %d under live textures; in all %llu left (%llu MB), %llu came back at a lookup",
+         (unsigned long long)frame, n, (unsigned long long)(bytes >> 20), (long long)idle_s, kept_raw, kept_tex, (unsigned long long)g_pool_unwired, (unsigned long long)g_pool_unwired_mb, (unsigned long long)g_pool_rewired);
+} }
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+    pool_unwire(frame);
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
