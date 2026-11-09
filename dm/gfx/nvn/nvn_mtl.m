@@ -2412,7 +2412,11 @@ uint64_t mtl_sub_commit(void) {
     [g_cb endCommandBuffer];
     rec_commit(g_cb, o);
     if (!lost_test) rec_signal(g_ev, fence);
-    rec_drain();
+    // DM_NVN_ENC_DRAIN=0: the submit thread does not wait for the encode thread at the end of a submission (it still does before another queue, an indirect-count read, a GPU wait and
+    // a present snapshot). Records retain their objects, the allocator picked next is one whose fence the GPU has signalled (encoded by then), and the game's SyncWaits wait for the GPU.
+    // Ocarina of Time submits 30-40 times a frame on the iPhone: the drains cost 6-11 ms of a 34 ms frame (DM_NVN_WAITS "encode thread drain")
+    static int drain_end = -1; if (drain_end < 0) { const char *e = getenv("DM_NVN_ENC_DRAIN"); drain_end = !e || atoi(e) != 0; if (!drain_end) MLOG("DM_NVN_ENC_DRAIN=0: the submit thread does not wait for the encode thread at the end of a submission"); }
+    if (drain_end) rec_drain(); else rec_publish();
     g_alloc_fence[g_alloc_cur] = fence;
     g_cb = nil;
     g_commit_blocks = nil;
