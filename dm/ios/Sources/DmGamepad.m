@@ -1,6 +1,10 @@
 // Virtual gamepad (Nintendo button positions) + physical controllers (GameController), handed to the host through dm_input_set and dm_pad_set_player (hle_hid.c, bit layout in dm_input.h).
 //   Two layouts, three in handheld mode, picked in the in-game menu (GameMenu.swift) that the menu button at the top centre (a gear) opens; the choice is kept in NSUserDefaults (each game is its own app, so per game); the first launch uses the game profile's pad_layout (DM_GAME_PAD_LAYOUT).
 //   The menu button stays while a physical controller is connected, so the menu is there in every layout and with every controller.
+//   Native (native, layout 3): a mobile game's layout in translucent keys, after the mock-up the player chose: a floating left stick (a thumb on the left half holds it,
+//     centred where it lands, or on the drawn ring), the camera (right stick) on any touch of the right half no key takes, and round icon keys whose button letter sits in a small
+//     chip (round for A B X Y + −, square for the shoulders R and ZL): B a sword, A a tap, R a shield, ZL a target, X a jump (two up arrows), Y a grid, + a menu, − a map; the menu button (…) at the top right.
+//     No D-pad, L, ZR, L3 or R3 (the 3D layout has them). Drawn as flat translucent shape layers (no gradients, no live blur), so it costs the GPU nothing over the picture.
 //   Tap (touch): no control but the menu button, every other touch goes to the game's local touch viewport; offered only while the game is in handheld mode, the only one in which it reads the touch screen (Balatro, played by touch).
 //   2D (simple): top corners ZL above L (one column), ZR above R likewise, teardrops with the tip toward the screen corner; − and + side by side at the top centre; the left stick in the bottom-left corner (fixed ring, tilt measured from the ring centre, small dead zone);
 //     the A (right) B (bottom) X (top) Y (left) diamond in the bottom-right corner, sliding a finger between keys switches keys. Each bottom corner holds a single control, so it sits close in (reaching halfway into the side safe-area inset).
@@ -130,7 +134,16 @@ static const CGFloat
     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
     K_CLICK_X = 102, K_CLICK_R = 17;                // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
 static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
-static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap, 3 = Native (DM_GAME_PAD_LAYOUT's numbers)
+static NSString *const k_native_key = @"DmPadNativeOffered";   // a profile that starts in Native switches to it once, over a layout saved before Native existed
+// Native layout (in points of an 874 x 402 landscape screen, scaled by gu; x from the corner rectangle's edges, y from its top or bottom): centre, radius
+static const int k_nat[] = {B_Y, B_A, B_B, B_ZR, B_ZL, B_X, B_R, B_PLUS, B_MINUS};
+static const NSTimeInterval K_ZL_TAP = 0.3;
+// Native D-pad (A7): above the stick at the left, its arms' outer edge N_DPAD_R from the centre; a touch within N_DPAD_GRAB of it takes the D-pad, and one landing in the band
+// out to N_DPAD_MOAT goes to neither (no stick starts right beside the D-pad). The stick's ring at home keeps clear of it
+static const CGFloat N_DPAD_X = 82, N_DPAD_Y = 242, N_DPAD_R = 46, N_ARM_W = 15, N_ARM_IN = 9, N_DPAD_GRAB = 1.3, N_DPAD_MOAT = 1.65, N_DPAD_CLEAR = 10;
+static const struct { int b; CGFloat angle; } k_ndpad[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};   // Native: a ZL touch shorter than this (seconds) locks the target
+static const CGFloat N_RING_R = 71, N_KNOB_R = 31, N_STICK_X = 124, N_STICK_Y = 108, N_MENU_X = 93, N_TOP_Y = 38, N_TOP_R = 26, N_MENU_R = 21;   // A5: 15% larger than the first Native layout; A7: + and − larger (their chest and map icons), the menu between them as before
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
 
 @interface DmGamepad : UIView
@@ -164,9 +177,36 @@ static void pads_start(void);   // Physical controllers, below
     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
     DmLayout _layout;
     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
+    BOOL _native;                                  // the Native layout is current
+    CALayer *_nat, *_nk[B_N]; CAShapeLayer *_nbase[B_N];   // Native: its layers, one translucent disc per key and the disc's base (its fill shows the press)
+    CALayer *_nring, *_nknob; CAShapeLayer *_nknobBase;    // Native: the left stick's ring and knob
+    CGPoint _lCentre;                              // Native: the left stick's centre while held (where its touch landed, or the ring)
+    BOOL _zlLock, _zlShown; NSTimeInterval _zlDown;          // Native: ZL (target) locked on by a quick tap, held until the next tap; when the touch holding ZL landed
+    CALayer *_zlMark;                              // Native: the lock badge on ZL, shown while it is locked
 }
 
 static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+// Themes (DM_PAD_THEME, default the profile's pad_theme): each key's own idle / pressed fill, rim and label colours, and the stick's and menu button's. Classic is every key the
+// shared translucent white above; Forest is an original palette after the N64 controller and the woods (blue A, green B, yellow X / Y like C buttons, red +, deep green shoulders,
+// bronze D-pad, gold rims, cream labels), with no game artwork. Every colour keeps its own low opacity, as above, so the picture shows through
+static UIColor *k_kidle[B_N], *k_kon[B_N], *k_kline[B_N], *k_ktext[B_N], *k_ktextOn[B_N], *k_knobIdle, *k_knobOn, *k_knobLine, *k_menuFill, *k_menuLine;
+static UIColor *rgba(uint32_t rgb, CGFloat a) { return [UIColor colorWithRed:((rgb >> 16) & 255) / 255.0 green:((rgb >> 8) & 255) / 255.0 blue:(rgb & 255) / 255.0 alpha:a]; }
+static int pad_theme(void) { const char *e = getenv("DM_PAD_THEME"); return e && *e ? atoi(e) : DM_GAME_PAD_THEME; }   // 0 Classic, 1 Forest
+static void theme_init(void) {
+    for (int b = 0; b < B_N; b++) { k_kidle[b] = k_idle; k_kon[b] = k_on; k_kline[b] = k_line; k_ktext[b] = k_text; k_ktextOn[b] = k_textOn; }
+    k_knobIdle = k_idle; k_knobOn = k_on; k_knobLine = k_line; k_menuFill = k_idle; k_menuLine = k_line;
+    if (pad_theme() != 1) return;
+    const uint32_t gold = 0xd9b45a, cream = 0xf6ecd2, forest = 0x1f4d2b, night = 0x0c1f12;
+    static const uint32_t fill[B_N] = {   // A B X Y L3 R3 L R ZL ZR + − left up right down
+        0x2f62d8, 0x2f9a45, 0xf0c232, 0xf0c232, 0xb08a3a, 0xb08a3a, forest, forest, forest, forest, 0xcc3a30, 0x3c5a44, 0x8a6a3c, 0x8a6a3c, 0x8a6a3c, 0x8a6a3c };
+    for (int b = 0; b < B_N; b++) {
+        int bright = b == B_X || b == B_Y;   // yellow keys: dark labels read better
+        k_kidle[b] = rgba(fill[b], 0.36); k_kon[b] = rgba(fill[b], 0.68); k_kline[b] = rgba(gold, 0.62);
+        k_ktext[b] = bright ? rgba(night, 0.80) : rgba(cream, 0.88); k_ktextOn[b] = rgba(night, 0.85);
+    }
+    k_ringFill = rgba(forest, 0.16); k_knobIdle = rgba(0x2f9a45, 0.36); k_knobOn = rgba(gold, 0.62); k_knobLine = rgba(gold, 0.62);
+    k_menuFill = rgba(forest, 0.32); k_menuLine = rgba(gold, 0.62); k_text = rgba(cream, 0.88);
+}
 static CAShapeLayer *shape(CALayer *parent) {
     CAShapeLayer *l = [CAShapeLayer layer];
     l.fillColor = k_idle.CGColor; l.strokeColor = k_line.CGColor; l.lineWidth = 1.5;
@@ -178,6 +218,243 @@ static CATextLayer *label(CALayer *parent, NSString *s) {
     t.string = s; t.alignmentMode = kCAAlignmentCenter; t.foregroundColor = k_text.CGColor;
     [parent addSublayer:t]; return t;
 }
+// ---- Native layout: translucent keys ----
+// Each control is a flat translucent disc, as the 2D and 3D layouts draw theirs: a translucent white fill (brighter while pressed), a thin white outline, a white icon and the
+// button's letter in a chip. Shape layers only: no gradient, rim, highlight or backdrop blur
+static UIColor *g_glassIdle, *g_glassOn, *g_glassLine, *g_glassRing;
+static UIFont *rounded(CGFloat size) {
+    UIFontDescriptor *d = [[UIFont systemFontOfSize:size weight:UIFontWeightBold].fontDescriptor fontDescriptorWithDesign:UIFontDescriptorSystemDesignRounded];
+    return d ? [UIFont fontWithDescriptor:d size:size] : [UIFont systemFontOfSize:size weight:UIFontWeightBold];
+}
+static CATextLayer *chipText(CALayer *parent, NSString *s, CGPoint c, CGFloat size, CGFloat scale) {
+    CATextLayer *t = [CATextLayer layer]; UIFont *f = rounded(size);
+    t.string = s; t.font = (__bridge CFTypeRef)f; t.fontSize = size; t.alignmentMode = kCAAlignmentCenter; t.contentsScale = scale;
+    t.foregroundColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor;
+    CGFloat h = f.lineHeight, w = size * 3; t.frame = CGRectMake(c.x - w / 2, c.y - h / 2 - f.descender * 0.15, w, h);
+    t.shadowColor = UIColor.blackColor.CGColor; t.shadowOpacity = 0.45; t.shadowRadius = 1.5; t.shadowOffset = CGSizeMake(0, 1);
+    [parent addSublayer:t]; return t;
+}
+// A translucent disc of radius r in a layer of its own (bounds 2r, its centre at r, r): fill and a thin outline inset by half its width; *base gets the layer whose fill shows the press
+static CALayer *glassDiscFill(CGFloat r, CAShapeLayer **base, UIColor *fill) {
+    CALayer *g = [CALayer layer]; g.bounds = CGRectMake(0, 0, 2 * r, 2 * r);
+    CGRect b = g.bounds; CGPathRef circle = CGPathCreateWithEllipseInRect(CGRectInset(b, 0.75, 0.75), NULL);
+    CAShapeLayer *bl = [CAShapeLayer layer]; bl.frame = b; bl.path = circle; bl.fillColor = fill.CGColor;
+    bl.strokeColor = g_glassLine.CGColor; bl.lineWidth = 1.5;
+    bl.shadowColor = UIColor.blackColor.CGColor; bl.shadowOpacity = 0.2; bl.shadowRadius = 3; bl.shadowOffset = CGSizeMake(0, 1); bl.shadowPath = circle;
+    [g addSublayer:bl]; if (base) *base = bl;
+    CGPathRelease(circle);
+    return g;
+}
+static CALayer *glassDisc(CGFloat r, CAShapeLayer **base) { return glassDiscFill(r, base, g_glassIdle); }
+// The icon: an SF Symbol in white, centred in the disc
+static void glassSymbol(CALayer *g, NSString *name, CGFloat size, CGFloat scale) {
+    UIImage *im = [UIImage systemImageNamed:name withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightSemibold]];
+    if (!im) return;
+    im = [im imageWithTintColor:[UIColor colorWithWhite:1 alpha:0.95] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat]; fmt.scale = scale; fmt.opaque = NO;
+    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:im.size format:fmt] imageWithActions:^(UIGraphicsImageRendererContext *c) { (void)c; [im drawAtPoint:CGPointZero]; }];
+    CALayer *l = [CALayer layer]; l.contents = (__bridge id)flat.CGImage; l.contentsScale = scale; l.contentsGravity = kCAGravityResizeAspect;
+    CGSize sz = im.size; CGFloat r = g.bounds.size.width / 2; l.frame = CGRectMake(r - sz.width / 2, r - sz.height / 2, sz.width, sz.height);
+    l.shadowColor = UIColor.blackColor.CGColor; l.shadowOpacity = 0.4; l.shadowRadius = 1.5; l.shadowOffset = CGSizeMake(0, 1);
+    [g addSublayer:l];
+}
+// Native icons drawn for Ocarina of Time (kid-with-sword-remake A7): white shapes with a soft shadow, in units of s (the icon's half size, in points) around the key's centre.
+// Generated from one shape list with the preview (scratch icons.py); a part is filled (0), filled even-odd so inner shapes cut holes (1) or stroked (2), at its own opacity
+static void glassPartColor(CALayer *g, CGPathRef p, int mode, UIColor *w, CGFloat width) {
+    CAShapeLayer *l = [CAShapeLayer layer]; l.frame = g.bounds; l.path = p;
+    if (mode == 2) { l.fillColor = nil; l.strokeColor = w.CGColor; l.lineWidth = width; l.lineCap = kCALineCapRound; l.lineJoin = kCALineJoinRound; }
+    else { l.fillColor = w.CGColor; l.fillRule = mode == 1 ? kCAFillRuleEvenOdd : kCAFillRuleNonZero; }
+    l.shadowColor = UIColor.blackColor.CGColor; l.shadowOpacity = 0.4; l.shadowRadius = 1.5; l.shadowOffset = CGSizeMake(0, 1);
+    [g addSublayer:l];
+}
+static void glassPart(CALayer *g, CGPathRef p, int mode, CGFloat alpha, CGFloat width) { glassPartColor(g, p, mode, [UIColor colorWithWhite:1 alpha:alpha], width); }
+// The game's own Basic Controls (its pause menu, A12): Y attack (a sword with a winged guard), A actions (a roll arrow round an "!"), B put away (an arrow turning back), X jump
+// (a winged boot), ZL target, which raises the shield too (a fairy), ZR use item (a bow), R quick select items (a ring of slots), + the menu (a treasure chest), − the map (a scroll)
+static void iconBow(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, -0.35, -0.92);
+      CGPathAddQuadCurveToPoint(p, &m, 0.75, -0.6, 0.75, 0);
+      CGPathAddQuadCurveToPoint(p, &m, 0.75, 0.6, -0.35, 0.92);
+      glassPart(g, p, 2, 0.95, 0.13 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, -0.35, -0.92);
+      CGPathAddLineToPoint(p, &m, -0.35, 0.92);
+      glassPart(g, p, 2, 0.7, 0.06 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, -0.85, 0);
+      CGPathAddLineToPoint(p, &m, 0.62, 0);
+      glassPart(g, p, 2, 0.95, 0.1 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      { static const CGPoint q[] = {{0.95, 0}, {0.55, -0.2}, {0.55, 0.2}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconWheel(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.66, -0.66, 1.32, 1.32));
+      glassPart(g, p, 2, 0.55, 0.08 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.24, -0.9, 0.48, 0.48));
+      CGPathAddEllipseInRect(p, &m, CGRectMake(0.42, -0.24, 0.48, 0.48));
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.24, 0.42, 0.48, 0.48));
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.9, -0.24, 0.48, 0.48));
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconBack(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, 0.7, 0.55);
+      CGPathAddLineToPoint(p, &m, 0.7, 0.05);
+      CGPathAddQuadCurveToPoint(p, &m, 0.7, -0.35, 0.3, -0.35);
+      CGPathAddLineToPoint(p, &m, -0.55, -0.35);
+      glassPart(g, p, 2, 0.95, 0.14 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      { static const CGPoint q[] = {{-0.9, -0.35}, {-0.45, -0.72}, {-0.45, 0.02}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconSword(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 45 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      { static const CGPoint q[] = {{0, -1}, {0.12, -0.84}, {0.12, 0.22}, {-0.12, 0.22}, {-0.12, -0.84}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      { static const CGPoint q[] = {{-0.48, 0.12}, {-0.3, 0.24}, {0.3, 0.24}, {0.48, 0.12}, {0.42, 0.4}, {-0.42, 0.4}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.07, 0.38, 0.14, 0.4), 0.04, 0.04);
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.13, 0.73, 0.26, 0.26));
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconFairy(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, 0.14, -0.14);
+      CGPathAddQuadCurveToPoint(p, &m, 0.22, -1.0, 0.86, -0.9);
+      CGPathAddQuadCurveToPoint(p, &m, 0.98, -0.36, 0.22, -0.02);
+      CGPathCloseSubpath(p);
+      CGPathMoveToPoint(p, &m, -0.14, -0.14);
+      CGPathAddQuadCurveToPoint(p, &m, -0.22, -1.0, -0.86, -0.9);
+      CGPathAddQuadCurveToPoint(p, &m, -0.98, -0.36, -0.22, -0.02);
+      CGPathCloseSubpath(p);
+      CGPathMoveToPoint(p, &m, 0.16, 0.12);
+      CGPathAddQuadCurveToPoint(p, &m, 0.78, 0.12, 0.72, 0.58);
+      CGPathAddQuadCurveToPoint(p, &m, 0.4, 0.72, 0.12, 0.2);
+      CGPathCloseSubpath(p);
+      CGPathMoveToPoint(p, &m, -0.16, 0.12);
+      CGPathAddQuadCurveToPoint(p, &m, -0.78, 0.12, -0.72, 0.58);
+      CGPathAddQuadCurveToPoint(p, &m, -0.4, 0.72, -0.12, 0.2);
+      CGPathCloseSubpath(p);
+      glassPart(g, p, 0, 0.62, 0 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.4, -0.4, 0.8, 0.8));
+      glassPart(g, p, 2, 0.45, 0.07 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.27, -0.27, 0.54, 0.54));
+      glassPart(g, p, 0, 0.98, 0 * s); CGPathRelease(p); }
+}
+static void iconAction(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, 0.752, 0.274);
+      CGPathAddLineToPoint(p, &m, 0.675, 0.43);
+      CGPathAddLineToPoint(p, &m, 0.566, 0.566);
+      CGPathAddLineToPoint(p, &m, 0.43, 0.675);
+      CGPathAddLineToPoint(p, &m, 0.274, 0.752);
+      CGPathAddLineToPoint(p, &m, 0.104, 0.793);
+      CGPathAddLineToPoint(p, &m, -0.07, 0.797);
+      CGPathAddLineToPoint(p, &m, -0.241, 0.763);
+      CGPathAddLineToPoint(p, &m, -0.4, 0.693);
+      CGPathAddLineToPoint(p, &m, -0.54, 0.59);
+      CGPathAddLineToPoint(p, &m, -0.655, 0.459);
+      CGPathAddLineToPoint(p, &m, -0.739, 0.306);
+      CGPathAddLineToPoint(p, &m, -0.788, 0.139);
+      CGPathAddLineToPoint(p, &m, -0.799, -0.035);
+      CGPathAddLineToPoint(p, &m, -0.773, -0.207);
+      CGPathAddLineToPoint(p, &m, -0.71, -0.369);
+      CGPathAddLineToPoint(p, &m, -0.613, -0.514);
+      CGPathAddLineToPoint(p, &m, -0.487, -0.635);
+      CGPathAddLineToPoint(p, &m, -0.338, -0.725);
+      CGPathAddLineToPoint(p, &m, -0.173, -0.781);
+      CGPathAddLineToPoint(p, &m, -0.0, -0.8);
+      CGPathAddLineToPoint(p, &m, 0.173, -0.781);
+      CGPathAddLineToPoint(p, &m, 0.338, -0.725);
+      CGPathAddLineToPoint(p, &m, 0.487, -0.635);
+      CGPathAddLineToPoint(p, &m, 0.613, -0.514);
+      glassPart(g, p, 2, 0.95, 0.17 * s); CGPathRelease(p); }
+    { CGMutablePathRef p = CGPathCreateMutable();
+      { static const CGPoint q[] = {{0.806, -0.284}, {0.771, -0.699}, {0.403, -0.391}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.09, -0.46, 0.18, 0.5), 0.09, 0.09);
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.1, 0.18, 0.2, 0.2));
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconBoot(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, -0.32, -0.78);
+      CGPathAddLineToPoint(p, &m, 0.16, -0.78);
+      CGPathAddLineToPoint(p, &m, 0.16, 0.18);
+      CGPathAddQuadCurveToPoint(p, &m, 0.2, 0.34, 0.62, 0.36);
+      CGPathAddQuadCurveToPoint(p, &m, 0.95, 0.4, 0.95, 0.62);
+      CGPathAddLineToPoint(p, &m, 0.95, 0.8);
+      CGPathAddLineToPoint(p, &m, -0.32, 0.8);
+      CGPathCloseSubpath(p);
+      CGPathMoveToPoint(p, &m, -0.3, -0.5);
+      CGPathAddQuadCurveToPoint(p, &m, -0.85, -0.85, -0.98, -0.6);
+      CGPathAddQuadCurveToPoint(p, &m, -0.85, -0.32, -0.3, -0.22);
+      CGPathCloseSubpath(p);
+      CGPathMoveToPoint(p, &m, -0.3, -0.18);
+      CGPathAddQuadCurveToPoint(p, &m, -0.8, -0.42, -0.9, -0.18);
+      CGPathAddQuadCurveToPoint(p, &m, -0.75, 0.04, -0.3, 0.06);
+      CGPathCloseSubpath(p);
+      glassPart(g, p, 0, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconChest(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathMoveToPoint(p, &m, -0.88, -0.16);
+      CGPathAddLineToPoint(p, &m, -0.88, -0.4);
+      CGPathAddQuadCurveToPoint(p, &m, -0.88, -0.82, 0, -0.82);
+      CGPathAddQuadCurveToPoint(p, &m, 0.88, -0.82, 0.88, -0.4);
+      CGPathAddLineToPoint(p, &m, 0.88, -0.16);
+      CGPathCloseSubpath(p);
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.56, -0.62, 0.14, 0.4), 0.03, 0.03);
+      CGPathAddRoundedRect(p, &m, CGRectMake(0.42, -0.62, 0.14, 0.4), 0.03, 0.03);
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.88, -0.06, 1.76, 0.82), 0.06, 0.06);
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.14, 0.0, 0.28, 0.3), 0.05, 0.05);
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.56, 0.06, 0.14, 0.6), 0.03, 0.03);
+      CGPathAddRoundedRect(p, &m, CGRectMake(0.42, 0.06, 0.14, 0.6), 0.03, 0.03);
+      glassPart(g, p, 1, 0.95, 0 * s); CGPathRelease(p); }
+}
+static void iconMap(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformRotate(CGAffineTransformMakeTranslation(r, r), 0 * M_PI / 180), s, s);
+    { CGMutablePathRef p = CGPathCreateMutable();
+      CGPathAddRoundedRect(p, &m, CGRectMake(-0.98, -0.78, 0.3, 1.56), 0.15, 0.15);
+      CGPathAddRoundedRect(p, &m, CGRectMake(0.68, -0.78, 0.3, 1.56), 0.15, 0.15);
+      CGPathMoveToPoint(p, &m, -0.64, -0.62);
+      CGPathAddLineToPoint(p, &m, 0.64, -0.62);
+      CGPathAddLineToPoint(p, &m, 0.64, 0.62);
+      CGPathAddLineToPoint(p, &m, -0.64, 0.62);
+      CGPathCloseSubpath(p);
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.47, 0.29, 0.14, 0.14));
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.27, 0.13, 0.14, 0.14));
+      CGPathAddEllipseInRect(p, &m, CGRectMake(-0.07, -0.03, 0.14, 0.14));
+      { static const CGPoint q[] = {{0.14, -0.42}, {0.22, -0.42}, {0.3, -0.32}, {0.38, -0.42}, {0.46, -0.42}, {0.34, -0.27}, {0.46, -0.12}, {0.38, -0.12}, {0.3, -0.22}, {0.22, -0.12}, {0.14, -0.12}, {0.26, -0.27}}; CGPathAddLines(p, &m, q, sizeof q / sizeof *q); CGPathCloseSubpath(p); }
+      glassPart(g, p, 1, 0.95, 0 * s); CGPathRelease(p); }
+}
+
+// The button's letter: a small round chip at the lower right (face keys, + and −), or a rounded rectangle for a shoulder (R, ZL), so it never reads as a face key
+static void glassChip(CALayer *g, NSString *t, BOOL square, CGFloat scale) {
+    CGFloat r = g.bounds.size.width / 2;
+    if (square) {
+        CGFloat w = t.length > 1 ? 24 : 18, h = 15, cx = r + r * 0.62, cy = r + r * 0.66;
+        CAShapeLayer *c = [CAShapeLayer layer]; CGPathRef p = CGPathCreateWithRoundedRect(CGRectMake(cx - w / 2, cy - h / 2, w, h), 4, 4, NULL);
+        c.path = p; CGPathRelease(p); c.fillColor = [UIColor colorWithWhite:0 alpha:0.26].CGColor; c.strokeColor = [UIColor colorWithWhite:1 alpha:0.7].CGColor; c.lineWidth = 1.2;
+        [g addSublayer:c]; chipText(g, t, CGPointMake(cx, cy), 9.5, scale);
+        return;
+    }
+    CGFloat br = MIN(11.5, MAX(8.5, r * 0.34)), cx = r + r * 0.707 - br * 0.35, cy = r + r * 0.707 - br * 0.35;
+    CALayer *chip = glassDisc(br, NULL); chip.position = CGPointMake(cx, cy);
+    ((CAShapeLayer *)chip.sublayers.firstObject).fillColor = [UIColor colorWithWhite:0 alpha:0.18].CGColor;
+    [g addSublayer:chip]; chipText(g, t, CGPointMake(cx, cy), t.length > 1 ? br * 0.82 : br * 1.05, scale);
+}
+
 static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   // keys shown only in the 3D layout
 
 - (instancetype)initWithFrame:(CGRect)f {
@@ -198,29 +475,34 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
             k_idle = [UIColor colorWithWhite:1 alpha:0.14]; k_on = [UIColor colorWithWhite:1 alpha:0.45]; k_line = [UIColor colorWithWhite:1 alpha:0.38];
             k_ringFill = [UIColor colorWithWhite:1 alpha:0.06]; k_text = [UIColor colorWithWhite:1 alpha:0.6]; k_textOn = [UIColor colorWithWhite:0 alpha:0.7];
+            theme_init();
+            g_glassIdle = k_idle; g_glassOn = k_on; g_glassLine = k_line; g_glassRing = k_ringFill;   // Native: the same translucent white as the 2D and 3D layouts
         });
         _controls = [CALayer layer]; [self.layer addSublayer:_controls];
         _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;
-        _knob = shape(_controls);
-        CAShapeLayer *in = [CAShapeLayer layer]; in.fillColor = nil; in.strokeColor = k_line.CGColor; in.lineWidth = 1.5;   // inner ring of the knob
+        _knob = shape(_controls); _knob.strokeColor = k_knobLine.CGColor; _ring.strokeColor = k_knobLine.CGColor;
+        CAShapeLayer *in = [CAShapeLayer layer]; in.fillColor = nil; in.strokeColor = k_knobLine.CGColor; in.lineWidth = 1.5;   // inner ring of the knob
         [_knob addSublayer:in];
         static NSString *const names[B_N] = {@"A", @"B", @"X", @"Y", @"L3", @"R3", @"L", @"R", @"ZL", @"ZR", @"+", @"−"};
         for (int b = 0; b < B_N; b++) {
-            _key[b] = shape(_controls);
-            if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
+            _key[b] = shape(_controls); _key[b].fillColor = k_kidle[b].CGColor; _key[b].strokeColor = k_kline[b].CGColor;
+            if (names[b]) { _label[b] = label(_key[b], names[b]); _label[b].foregroundColor = k_ktext[b].CGColor; }   // the D-pad arms carry no label
         }
+        _nat = [CALayer layer]; [_controls addSublayer:_nat];   // the Native layout's layers, made in layoutSubviews (their sizes follow the screen)
         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
-        _menu.backgroundColor = k_idle; _menu.layer.borderColor = k_line.CGColor; _menu.layer.borderWidth = 1.5;
+        _menu.backgroundColor = k_menuFill; _menu.layer.borderColor = k_menuLine.CGColor; _menu.layer.borderWidth = 1.5;
         _menu.layer.shadowColor = UIColor.blackColor.CGColor; _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1);
         _menu.tintColor = k_text; _menu.accessibilityLabel = @"Menu";
         _menu.menu = CFBridgingRelease(dm_game_menu()); _menu.showsMenuAsPrimaryAction = YES;
         __weak DmGamepad *weakSelf = self;
         [_menu addAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; [weakSelf reset]; }] forControlEvents:UIControlEventMenuActionTriggered];   // the menu opens: release every key and touch first
         [self addSubview:_menu];
-        NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults; NSNumber *saved = [ud objectForKey:k_layout_key];
         int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
+        if (DM_GAME_PAD_LAYOUT == 3 && ![ud boolForKey:k_native_key]) { l = 3; [ud setBool:YES forKey:k_native_key]; [ud setObject:@(3) forKey:k_layout_key]; }   // once: a layout saved before Native existed gives way to it
         if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
-        _full = l == 1; _tap = l == 2;
+        if (l < 0 || l > 3) l = 0;
+        _full = l == 1; _tap = l == 2; _native = l == 3;
         [self applyLayout];
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidConnectNotification object:nil];
@@ -234,15 +516,16 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
 }
 - (void)applyLayout {   // show / hide the controls for the current layout
     [CATransaction begin]; [CATransaction setDisableActions:YES];
-    for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || (fullOnly(b) && !_full);
-    _ring.hidden = _knob.hidden = _tap;
+    for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || _native || (fullOnly(b) && !_full);
+    _ring.hidden = _knob.hidden = _tap || _native;
+    _nat.hidden = !_native;
     [CATransaction commit];
 }
-- (int)padLayout { return _tap ? 2 : _full ? 1 : 0; }
+- (int)padLayout { return _native ? 3 : _tap ? 2 : _full ? 1 : 0; }
 - (void)setPadLayout:(int)l {   // the in-game menu's pick: release every touch first (no key stays held), save, lay out again
     if (l == 2 && dm_opmode() != 0) l = 0;
     [self reset];
-    _full = l == 1; _tap = l == 2;
+    _full = l == 1; _tap = l == 2; _native = l == 3;
     [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:k_layout_key];
     [self applyLayout]; [self setNeedsLayout];
 }
@@ -266,6 +549,29 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
 - (CGRect)corner { if (_layout.separated) return self.safe; UIEdgeInsets i = self.safeAreaInsets; i.left *= K_CORNER_IN; i.right *= K_CORNER_IN; return UIEdgeInsetsInsetRect(self.bounds, i); }   // the rectangle the bottom-corner controls use
 - (CGFloat)u { if (_layout.separated) { CGRect s = self.safe; return MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3); } return MIN(self.bounds.size.height / 430.0, 1.3); }   // 1 = 430 points tall (iPhone Pro Max landscape)
 static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPointMake(right ? CGRectGetMaxX(s) - dx : CGRectGetMinX(s) + dx, y); }
+// Native: 1 = an 874 x 402 point landscape screen (iPhone 18 Pro), the size the mock-up was drawn for
+- (CGFloat)gu { CGRect s = self.corner; return MIN(MIN(s.size.width / 437.0, s.size.height / 402.0), 1.3); }
+- (void)nat:(int)b centre:(CGPoint *)c radius:(CGFloat *)r {   // a Native key's centre and radius
+    CGRect s = self.corner; CGFloat g = self.gu, R = CGRectGetMaxX(s), T = CGRectGetMinY(s), Bt = CGRectGetMaxY(s);
+    CGFloat x = 0, y = 0, rr = 0;
+    switch (b) {
+        // Built around Ocarina of Time's own Basic Controls (its pause menu; A12 corrects A7, which had B as the sword and R as a shield the game does not have): Y (attack) the
+        // large key where the thumb rests, and an arc 104 to 110 points around it in the order the thumb reaches: A (actions: roll, interact, hold to dash) inward and low,
+        // ZR (use item) and ZL (target, which also raises the shield) above it, held together to aim, X (jump) at the outer edge; R (quick select items) apart, top right;
+        // B (put away) small in the bottom right corner
+        case B_Y: x = R - 100 * g; y = Bt - 96 * g; rr = 44; break;
+        case B_A: x = R - 200 * g; y = Bt - 69 * g; rr = 32; break;
+        case B_ZR: x = R - 190 * g; y = Bt - 159 * g; rr = 28; break;
+        case B_ZL: x = R - 128 * g; y = Bt - 202 * g; rr = 28; break;
+        case B_X: x = R - 46 * g; y = Bt - 188 * g; rr = 28; break;
+        case B_R: x = R - 44 * g; y = Bt - 264 * g; rr = 24; break;
+        case B_B: x = R - 30 * g; y = Bt - 36 * g; rr = 22; break;
+        case B_PLUS: x = R - 150 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // A7: beside the menu and −, off the hearts at the top left
+        default: x = R - 36 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
+    }
+    *c = CGPointMake(x, y); *r = rr * g;
+}
+- (CGPoint)natStickHome { CGRect s = self.corner; CGFloat g = self.gu; return CGPointMake(CGRectGetMinX(s) + N_STICK_X * g, CGRectGetMaxY(s) - N_STICK_Y * g); }
 - (BOOL)portraitControls { return _layout.separated && self.bounds.size.height > self.bounds.size.width; }
 - (CGPoint)portraitThumbCenter:(BOOL)right {
     CGRect s = self.safe;
@@ -290,10 +596,11 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
     CGRect s = self.corner;
     return side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u);
 }
-- (CGPoint)stickCentre:(int)i { return i ? _rCentre : self.stickHome; }
-- (CGFloat)stickR:(int)i { return (i ? K_RSTICK_R : K_STICK_R) * self.u; }
+- (CGPoint)stickCentre:(int)i { return i ? _rCentre : _native ? (_stick[0] ? _lCentre : self.natStickHome) : self.stickHome; }
+- (CGFloat)stickR:(int)i { return i ? K_RSTICK_R * self.u : _native ? N_RING_R * self.gu : K_STICK_R * self.u; }
 - (BOOL)inRightArea:(CGPoint)p { CGRect b = _layout.controls; return p.x >= CGRectGetMaxX(b) - b.size.width * K_RSWIPE; }
 - (CGPoint)dpadCenter {
+    if (_native) { CGRect s = self.corner; CGFloat g = self.gu; return CGPointMake(CGRectGetMinX(s) + N_DPAD_X * g, CGRectGetMaxY(s) - N_DPAD_Y * g); }
     if (self.portraitControls) {
         CGPoint p = [self portraitThumbCenter:NO];
         p.x += [self stickR:0] + 6 * self.u;
@@ -302,7 +609,7 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
     CGRect s = self.corner; CGFloat u = self.u;
     return side(s, 0, K_LOW_X * u, CGRectGetMaxY(s) - K_LOW_Y * u);
 }
-- (CGFloat)dpadR { return K_DPAD_R * self.u; }
+- (CGFloat)dpadR { return _native ? N_DPAD_R * self.gu : K_DPAD_R * self.u; }
 static BOOL isDrop(int b) { return b == B_ZL || b == B_L || b == B_ZR || b == B_R; }
 static BOOL isClick(int b) { return b == B_LS || b == B_RS; }
 - (CGPoint)dropCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; BOOL z = b == B_ZL || b == B_ZR;
@@ -314,11 +621,13 @@ static BOOL isClick(int b) { return b == B_LS || b == B_RS; }
 - (CGRect)pillRect:(int)b { CGRect s = self.safe; CGFloat u = self.u, w = K_PILL_W * u, h = K_PILL_H * u;
     CGPoint c = CGPointMake(CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u, CGRectGetMinY(s) + MAX(K_PILL_Y * u, _layout.separated ? 14 : 0));   // − on the left, + on the right
     return CGRectMake(c.x - w / 2, c.y - h / 2, w, h); }
-- (CGPoint)menuCenter { CGRect s = self.safe; return CGPointMake(CGRectGetMidX(s), CGRectGetMinY(s) + MAX(K_PILL_Y * self.u, _layout.separated ? 14 : 0)); }
+- (CGPoint)menuCenter { if (_native) { CGRect c = self.corner; return CGPointMake(CGRectGetMaxX(c) - N_MENU_X * self.gu, CGRectGetMinY(c) + N_TOP_Y * self.gu); }
+    CGRect s = self.safe; return CGPointMake(CGRectGetMidX(s), CGRectGetMinY(s) + MAX(K_PILL_Y * self.u, _layout.separated ? 14 : 0)); }
 
 static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
 - (CGFloat)buttonDistance:(int)b point:(CGPoint)p {
     CGFloat u = self.u;
+    if (_native) { CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r]; return dist(p, c) / MAX(r * 1.25, 22); }
     if (isDrop(b)) return dist(p, [self dropCenter:b]) / MAX([self dropR:b] * 1.35, _layout.separated ? 22 : 0);
     if (isClick(b)) return dist(p, [self clickCenter:b]) / MAX(K_CLICK_R * u * 1.35, _layout.separated ? 22 : 0);
     CGRect r = CGRectInset([self pillRect:b], -8 * u, -8 * u);
@@ -328,6 +637,10 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
 }
 - (int)btnAt:(CGPoint)p {   // Locked at touch-down; nearest normalized target wins overlapping separated-layout hits.
     int best = -1; CGFloat distance = 1;
+    if (_native) {   // Native: every key is locked at touch-down, the nearest within 1.25 times its radius (at least 22 points)
+        for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { CGFloat d = [self buttonDistance:k_nat[i] point:p]; if (d <= 1 && (best < 0 || d < distance)) { best = k_nat[i]; distance = d; } }
+        return best;
+    }
     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
         if (fullOnly(b) && !_full) continue;
         CGFloat d = [self buttonDistance:b point:p];
@@ -338,7 +651,7 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     }
     return best;
 }
-- (CGFloat)menuDistance:(CGPoint)p { return dist(p, self.menuCenter) / MAX(K_MENU_R * self.u * 1.6, 22); }
+- (CGFloat)menuDistance:(CGPoint)p { return dist(p, self.menuCenter) / MAX((_native ? N_MENU_R * self.gu * 1.25 : K_MENU_R * self.u * 1.6), 22); }
 - (BOOL)menuTakes:(CGPoint)p {   // the menu button takes a touch in its hit circle unless a locked key's target is nearer (the drawn keys are hidden in Tap and with a controller)
     CGFloat d = [self menuDistance:p]; if (d > 1) return NO;
     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
@@ -374,6 +687,7 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     for (UITouch *t in _owner) { uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff);
         if (c == C_BTN) btn |= 1ull << (v >> 8);
         else if (c == C_DPAD) dpad |= [self dpadAt:[t locationInView:self]]; }
+    if (_zlLock && _native) btn |= 1ull << B_ZL;
     int32_t ax[4] = {0};
     for (int i = 0; i < 2; i++) {
         CGPoint o = [self knobOffset:i]; CGFloat R = [self stickR:i], d = hypot(o.x, o.y), dz = R * K_DEAD;
@@ -381,14 +695,14 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
         CGFloat m = fmin((d - dz) / (R * K_FULL - dz), 1) / d;   // outside the dead zone: 0 rising to full at the full-tilt radius
         ax[i * 2] = (int32_t)lrint(o.x * m * 32767); ax[i * 2 + 1] = (int32_t)lrint(-o.y * m * 32767);   // host: up is positive; rounded so full tilt is exactly 32767
     }
-    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits;
+    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits || _zlLock != _zlShown;   // a tap that locks ZL keeps it held: only the badge changes
     uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
     unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
     if (pressed || (gripping & ~_hapticSticks)) {
         [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
     }
     _hapticSticks = gripping;
-    _faceBits = face; _dpadBits = dpad; _btnBits = btn;
+    _faceBits = face; _dpadBits = dpad; _btnBits = btn; _zlShown = _zlLock;
     pthread_mutex_lock(&g_mu);
     g_touch_btn = face | dpad | btn; g_touch_lx = ax[0]; g_touch_ly = ax[1]; g_touch_rx = ax[2]; g_touch_ry = ax[3];
     pthread_mutex_unlock(&g_mu);
@@ -419,6 +733,7 @@ int front_web_touch(void);
 - (BOOL)controlAt:(CGPoint)p {
     if (_padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return NO;
     if (_tap) return NO;
+    if (_native) return YES;   // keys, and the two sticks take the rest
     if ([self btnAt:p] >= 0) return YES;
     if (dist(p, self.faceCenter) / (self.faceGap + MAX(self.faceR * 1.6, self.faceHitR)) <= 1) return YES;
     if (_full && dist(p, self.dpadCenter) / MAX(self.dpadR * K_DPAD_GRAB, _layout.separated ? 22 : 0) < 1) return YES;
@@ -436,7 +751,23 @@ int front_web_touch(void);
         CGPoint p = [t locationInView:self];
         if (_layout.separated && !CGRectContainsPoint(_layout.controls, p)) { game |= [self gameBegin:t]; continue; }
         int hit = _tap ? -1 : [self btnAt:p];   // the menu button took its own touches (menuTakes)
+        if (hit == B_ZL && _native && _zlLock) { _zlLock = NO; [_owner setObject:@(C_NONE) forKey:t]; continue; }   // a tap on a locked target releases it (the touch presses nothing)
+        if (hit == B_ZL && _native) _zlDown = t.timestamp;
         if (hit >= 0) { [_owner setObject:@(C_BTN | (uint64_t)hit << 8) forKey:t]; continue; }
+        if (_native) {   // Native: the D-pad takes its own touches; the left half holds the left stick (centred on its ring when the touch lands on it, else where it lands), the right half the camera
+            CGFloat dd = dist(p, self.dpadCenter) / self.dpadR;   // a touch keeps what it took at touch-down: the stick's thumb sliding over the D-pad presses nothing, and the reverse
+            if (dd <= N_DPAD_GRAB) { [_owner setObject:@(C_DPAD) forKey:t]; continue; }
+            if (dd <= N_DPAD_MOAT && dist(p, self.natStickHome) > N_RING_R * self.gu) { game |= [self gameBegin:t]; continue; }   // the stick's own ring still takes its touches
+            int idx = p.x < CGRectGetMidX(_layout.controls) ? 0 : 1;
+            if (_stick[idx]) { game |= [self gameBegin:t]; continue; }
+            if (idx == 0) { CGPoint h = self.natStickHome; _lCentre = dist(p, h) <= N_RING_R * self.gu ? h : p;
+                // the ring never reaches the D-pad: a centre too close to it moves straight down until the ring clears it by N_DPAD_CLEAR (the knob stays inside the ring)
+                CGPoint dc = self.dpadCenter; CGFloat need = N_RING_R * self.gu + self.dpadR + N_DPAD_CLEAR * self.gu, dx = _lCentre.x - dc.x;
+                if (fabs(dx) < need && dist(_lCentre, dc) < need) _lCentre.y = dc.y + sqrt(need * need - dx * dx);
+            } else _rCentre = p;
+            [_owner setObject:@(C_STICK | (uint64_t)idx << 8) forKey:t]; _stick[idx] = t; _stickNow[idx] = p;
+            continue;
+        }
         if (_tap) { game |= [self gameBegin:t]; continue; }
         // diamond, D-pad, left stick: take the one with the smallest distance / grab radius, if it is <= 1
         CGFloat best = 1; int kind = C_NONE, idx = 0;
@@ -470,6 +801,7 @@ int front_web_touch(void);
     for (UITouch *t in ts) {
         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue;
         if ((v & 0xff) == C_GAME && (v >> 8) < 16) { _game[v >> 8] = nil; game = YES; }
+        if (ended && _native && v == (C_BTN | (uint64_t)B_ZL << 8) && t.timestamp - _zlDown < K_ZL_TAP) _zlLock = YES;   // a quick tap locks the target on; a longer press stays a plain hold
         [_owner removeObjectForKey:t]; [_faceOf removeObjectForKey:t]; for (int i = 0; i < 2; i++) if (t == _stick[i]) _stick[i] = nil;
     }
     if (game) [self pushGame];
@@ -477,7 +809,7 @@ int front_web_touch(void);
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
-- (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
+- (void)reset { _zlLock = NO; [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
 
 // ---- Shapes ----
 static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
@@ -533,10 +865,15 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     }
     static const struct { int b; CGFloat angle; } arms[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};   // the same arm in 90° steps
     for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, K_ARM_W * u, K_ARM_IN * u, arms[i].angle, 6 * u));
-    CGFloat mr = K_MENU_R * u; CGPoint mc = self.menuCenter;
+    CGFloat mr = _native ? N_MENU_R * self.gu : K_MENU_R * u; CGPoint mc = self.menuCenter;
     _menu.frame = CGRectMake(mc.x - mr, mc.y - mr, 2 * mr, 2 * mr); _menu.layer.cornerRadius = mr;
     _menu.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:_menu.bounds].CGPath;
-    [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * u weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
+    if (_native) { _menu.backgroundColor = g_glassIdle; _menu.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor; _menu.layer.borderWidth = 1.2; _menu.tintColor = [UIColor colorWithWhite:1 alpha:0.95];
+                   _menu.layer.shadowOpacity = 0.10; _menu.layer.shadowRadius = 6; _menu.layer.shadowOffset = CGSizeMake(0, 2); }
+    else { _menu.backgroundColor = k_menuFill; _menu.layer.borderColor = k_menuLine.CGColor; _menu.layer.borderWidth = 1.5; _menu.tintColor = k_text;
+           _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1); }
+    [_menu setImage:[UIImage systemImageNamed:_native ? @"ellipsis" : @"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:(_native ? 11 * self.gu : 13 * u) weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
+    [self layoutNative:scale];
     setPath(_ring, circlePath(self.stickHome, [self stickR:0]));
     CGFloat k = K_KNOB_R * u; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
     setPath(_knob, circlePath(CGPointMake(k, k), k));
@@ -545,14 +882,65 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     [CATransaction commit];
     [self refresh];
 }
+// Native: the translucent keys and the stick, made again at each layout (sizes and places follow the screen); refresh only moves the stick and swaps the pressed fills
+- (void)layoutNative:(CGFloat)scale {
+    _nat.frame = self.layer.bounds;
+    for (CALayer *l in [_nat.sublayers copy]) [l removeFromSuperlayer];
+    for (int b = 0; b < B_N; b++) { _nk[b] = nil; _nbase[b] = nil; } _zlMark = nil;
+    if (!_native) { _nring = _nknob = nil; _nknobBase = nil; return; }
+    CGFloat g = self.gu;
+    _nring = glassDiscFill(N_RING_R * g, NULL, g_glassRing); _nring.position = self.natStickHome; [_nat addSublayer:_nring];
+    CAShapeLayer *kb = nil; _nknob = glassDisc(N_KNOB_R * g, &kb); _nknobBase = kb; _nknob.position = self.natStickHome; [_nat addSublayer:_nknob];
+    for (int i = 0; i < 4; i++) {   // the D-pad: four translucent arms, each with a white arrowhead near its outer end, in the keys' own white
+        int b = k_ndpad[i].b; CGFloat an = k_ndpad[i].angle, cs = cos(an), sn = sin(an); CGPoint c = self.dpadCenter, rot;
+        CAShapeLayer *arm = [CAShapeLayer layer]; arm.frame = _nat.bounds; CGPathRef ap = armPath(c, N_DPAD_R * g, N_ARM_W * g, N_ARM_IN * g, an, 5 * g);
+        arm.path = ap; arm.shadowPath = ap; CGPathRelease(ap); arm.fillColor = g_glassIdle.CGColor; arm.strokeColor = g_glassLine.CGColor; arm.lineWidth = 1.5;
+        arm.shadowColor = UIColor.blackColor.CGColor; arm.shadowOpacity = 0.2; arm.shadowRadius = 3; arm.shadowOffset = CGSizeMake(0, 1);
+        CGPoint v[3] = {{0, -0.86 * N_DPAD_R * g}, {7 * g, -0.6 * N_DPAD_R * g}, {-7 * g, -0.6 * N_DPAD_R * g}};   // pointing outward, drawn for the up arm and turned
+        CGMutablePathRef tp = CGPathCreateMutable();
+        for (int k = 0; k < 3; k++) { rot = CGPointMake(c.x + v[k].x * cs - v[k].y * sn, c.y + v[k].x * sn + v[k].y * cs); if (k) CGPathAddLineToPoint(tp, NULL, rot.x, rot.y); else CGPathMoveToPoint(tp, NULL, rot.x, rot.y); }
+        CGPathCloseSubpath(tp); glassPart(arm, tp, 0, 0.95, 0); CGPathRelease(tp);
+        [_nat addSublayer:arm]; _nbase[b] = arm;
+    }
+    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
+    for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
+        CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
+        CGFloat s = r * 0.52;   // the icon's half size: the letter chip keeps the lower right corner
+        switch (b) {
+            case B_Y: iconSword(d, r * 0.58); break;
+            case B_B: iconBack(d, s); break;
+            case B_ZR: iconBow(d, s); break;
+            case B_R: iconWheel(d, s); break;
+            case B_ZL: iconFairy(d, s); break;
+            case B_A: iconAction(d, s); break;
+            case B_X: iconBoot(d, s); break;
+            case B_PLUS: iconChest(d, s); break;
+            default: iconMap(d, s); break;   // −
+        }
+        glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);
+        [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base;
+        if (b == B_ZL) {   // the lock badge: a small disc with a padlock at the key's upper right
+            CGFloat br = 10 * g; CAShapeLayer *mb = nil; CALayer *m = glassDiscFill(br, &mb, [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.9]);
+            glassSymbol(m, @"lock.fill", 9 * g, scale); m.position = CGPointMake(r + r * 0.72, r - r * 0.72); m.hidden = !_zlLock; [d addSublayer:m]; _zlMark = m;
+        }
+    }
+}
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
 - (void)refresh {   // pressed state → fill, sticks → knob position
     uint64_t all = _faceBits | _dpadBits | _btnBits;
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (int b = 0; b < B_N; b++) { BOOL on = (all >> b) & 1;
-        _key[b].fillColor = (on ? k_on : k_idle).CGColor; _label[b].foregroundColor = (on ? k_textOn : k_text).CGColor; }
+        _key[b].fillColor = (on ? k_kon[b] : k_kidle[b]).CGColor; _label[b].foregroundColor = (on ? k_ktextOn[b] : k_ktext[b]).CGColor; }
     CGPoint h = self.stickHome, o = [self knobOffset:0];
-    _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
+    _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_knobOn : k_knobIdle).CGColor;
+    if (_native) {   // pressed: the base turns a brighter white and the disc grows a little; the stick's ring sits where it is held, its knob follows the thumb
+        for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; BOOL on = (all >> b) & 1;
+            _nbase[b].fillColor = (on ? g_glassOn : g_glassIdle).CGColor; _nk[b].transform = on ? CATransform3DMakeScale(1.06, 1.06, 1) : CATransform3DIdentity; }
+        for (int i = 0; i < 4; i++) { int b = k_ndpad[i].b; _nbase[b].fillColor = ((all >> b) & 1 ? g_glassOn : g_glassIdle).CGColor; }
+        _zlMark.hidden = !_zlLock; _nbase[B_ZL].strokeColor = (_zlLock ? [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.95] : g_glassLine).CGColor; _nbase[B_ZL].lineWidth = _zlLock ? 2.5 : 1.5;
+        CGPoint c = [self stickCentre:0]; _nring.position = c; _nknob.position = CGPointMake(c.x + o.x, c.y + o.y);
+        _nknobBase.fillColor = (_stick[0] ? g_glassOn : g_glassIdle).CGColor;
+    }
     [CATransaction commit];
 }
 
@@ -747,7 +1135,7 @@ void dm_gamepad_arrange(UIView *view, DmLayout layout) { [(DmGamepad *)view arra
 void dm_gamepad_opmode_changed(void) { [g_view opmodeChanged]; }
 void dm_gamepad_touch_feedback(bool on) { [g_view setTouchFeedback:on]; }
 int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
-bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
+bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || layout == 3 || (layout == 2 && dm_opmode() == 0); }
 void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
 void dm_gamepad_active(void) { dispatch_async(dispatch_get_main_queue(), ^{ for (GCController *c in GCController.controllers) dm_motion_rearm(c); }); }   // On become active: motion_apple.h
 void dm_gamepad_reset(void) {   // On resign active: release everything (a key held while switching away and released in background gets no "release")

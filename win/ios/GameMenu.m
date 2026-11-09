@@ -5,9 +5,9 @@
 #include "DmGameMenu.h"
 
 static UIMenu *game_menu_items(void) {
-    NSArray<NSString *> *names = @[@"2D", @"3D", @"Tap"];
+    NSArray<NSString *> *names = @[@"2D", @"3D", @"Tap", @"Native"];
     NSMutableArray<UIMenuElement *> *layouts = [NSMutableArray array];
-    for (int l = 0; l < 3; l++) {
+    for (int l = 0; l < 4; l++) {
         if (!dm_pad_layout_offered(l)) continue;
         int pick = l;
         UIAction *a = [UIAction actionWithTitle:names[l] image:nil identifier:nil handler:^(__kindof UIAction *action) { (void)action; dm_pad_layout_set(pick); }];
