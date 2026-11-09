@@ -5020,9 +5020,10 @@ static void pool_unwire(uint64_t frame) { @autoreleasepool {
     MLOG("pool unwire at frame %llu: %d pools (%llu MB) idle for %lld s left the residency set; kept %d the pool table lists and %d under live textures; in all %llu left (%llu MB), %llu came back at a lookup",
          (unsigned long long)frame, n, (unsigned long long)(bytes >> 20), (long long)idle_s, kept_raw, kept_tex, (unsigned long long)g_pool_unwired, (unsigned long long)g_pool_unwired_mb, (unsigned long long)g_pool_rewired);
 } }
-static void tex_cold_retire(uint64_t frame);
+static void tex_cold_retire(uint64_t frame); static uint64_t g_gmem_unmapped;
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pool_unwire(frame); tex_cold_retire(frame);
+    { static uint64_t last; uint64_t u = g_gmem_unmapped; if (u != last) { MLOG("raw pool table up to frame %llu: %llu pools left out so far for a page not mapped readable (released memory under a registered pool)", frame, (unsigned long long)u); last = u; } }
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
@@ -10308,6 +10309,21 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change; the replaced table goes through
 // deferred release, so submissions encoded with it keep it. Only pools something gave an address in are listed (mtl_pool_addressed), each made resident, as the shader may reach any of them
 static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
+// Whether every page of [lo, hi) is mapped readable. The game gives memory back by making its pages PROT_NONE in the guest files (hle_svc.c guest_release, SetHeapSize, the alias region's
+// unmaps), while the pool objects over them stay registered and addressed; wiring such a pool's zero-copy buffer for the pool table is what sat in the kernel for good on an iPhone 16 Pro Max
+// (IOGPUResourceGroupUpdateResources in res_commit from gmem_map, 5 starts of 12: logs aa12734d, 929da398, a9c847bd, 046de7b5, 8271a5c0; whole pools or chunks, one commit or batches, at
+// the title movie or at the first submission alike). A pool with a page that is not readable is left out of the table (a raw read of it gives 0, as it would of the released memory) and
+// not wired; it is looked at again at the next table build, once its memory is mapped again. DM_NVN_GMEM_PROT=0 turns the check off
+static int range_readable(uintptr_t lo, uintptr_t hi) {
+    for (vm_address_t r = lo; r < hi; ) {
+        vm_size_t rs = 0; vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) != KERN_SUCCESS || r > lo) return 0;   // nothing mapped at r
+        if (!(vi.protection & VM_PROT_READ)) return 0;
+        lo = r += rs;
+    }
+    return 1;
+}
+static uint64_t g_gmem_unmapped;   // pools the table left out for a page not mapped readable (cumulative, for the log line)
 static id<MTLBuffer> gmem_map(void) {
     uint64_t gen = atomic_load(&g_pool_gen);
     if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
@@ -10322,7 +10338,9 @@ static id<MTLBuffer> gmem_map(void) {
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!addr_meets(p->lo, p->hi)) continue;
-        if (!p->res) { [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; }
+        if (!p->res) { static int prot = -1; if (prot < 0) { const char *e = getenv("DM_NVN_GMEM_PROT"); prot = !e || atoi(e); }
+            if (prot && !range_readable(p->lo, p->hi)) { g_gmem_unmapped++; continue; }   // released memory under a registered pool: not listed, not wired (above)
+            [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
@@ -10348,7 +10366,7 @@ static id<MTLBuffer> gmem_map(void) {
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
-    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, (unsigned long long)gen); }
+    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes; %llu pools left out so far for a page not mapped readable", n - 1, (unsigned long long)gen, (unsigned long long)g_gmem_unmapped); }
     return b;
 }
 static uint64_t gmem_map_gpu(void) { return gmem_map().gpuAddress; }
