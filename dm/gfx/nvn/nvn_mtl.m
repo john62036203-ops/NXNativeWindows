@@ -519,7 +519,15 @@ void mtl_res_stats(char *out, size_t n) {
     size_t o = snprintf(out, n, "commits %llu / %.1f ms, added %llu, %.0f MB (", (unsigned long long)g_rs_commits, g_rs_commit_ns / 1e6, (unsigned long long)tn, tb / 1048576.0);
     for (int i = 0; i < 4 && o < n; i++) { int best = -1; for (int k = 0; k < RS_SITES; k++) if (g_rs_site[k].n && (best < 0 || g_rs_site[k].bytes > g_rs_site[best].bytes)) best = k;
         if (best < 0) break; o += snprintf(out + o, n - o, "%sline %d: %llu, %.0f MB", i ? ", " : "", g_rs_site[best].line, (unsigned long long)g_rs_site[best].n, g_rs_site[best].bytes / 1048576.0); g_rs_site[best].n = 0; }
-    if (o < n) snprintf(out + o, n - o, "), removed %llu, %lu allocations in the set (%.0f MB)", (unsigned long long)g_rs_rm, g_res ? (unsigned long)g_res.allocationCount : 0ul, g_res ? g_res.allocatedSize / 1048576.0 : 0.0);
+    if (o < n) o += snprintf(out + o, n - o, "), removed %llu, %lu allocations in the set (%.0f MB)", (unsigned long long)g_rs_rm, g_res ? (unsigned long)g_res.allocationCount : 0ul, g_res ? g_res.allocatedSize / 1048576.0 : 0.0);
+    // What the set is made of (every 300 frames; Ocarina of Time's set reaches 4.3 GB on the iPhone and the game slows as iOS pages its file-backed memory): heaps, textures by storage mode, buffers, and the three largest buffers
+    if (g_res_objects && o < n) @autoreleasepool { uint64_t hb = 0, tpb = 0, tsb = 0, bb = 0, big[3] = {0, 0, 0}; unsigned hn = 0, tpn = 0, tsn = 0, bn = 0;
+        for (id obj in g_res_objects) { uint64_t z = [obj respondsToSelector:@selector(allocatedSize)] ? [(id<MTLResource>)obj allocatedSize] : 0;
+            if ([obj conformsToProtocol:@protocol(MTLHeap)]) { hn++; hb += ((id<MTLHeap>)obj).currentAllocatedSize; }
+            else if ([obj conformsToProtocol:@protocol(MTLTexture)]) { if (((id<MTLTexture>)obj).storageMode == MTLStorageModePrivate) { tpn++; tpb += z; } else { tsn++; tsb += z; } }
+            else { bn++; bb += z; for (int k = 0; k < 3; k++) if (z > big[k]) { for (int j = 2; j > k; j--) big[j] = big[j - 1]; big[k] = z; break; } } }
+        snprintf(out + o, n - o, "; the set holds heaps %u (%.0f MB), private textures %u (%.0f MB), shared textures %u (%.0f MB), buffers %u (%.0f MB; largest %.0f / %.0f / %.0f MB)",
+            hn, hb / 1048576.0, tpn, tpb / 1048576.0, tsn, tsb / 1048576.0, bn, bb / 1048576.0, big[0] / 1048576.0, big[1] / 1048576.0, big[2] / 1048576.0); }
     memset(g_rs_site, 0, sizeof g_rs_site); g_rs_rm = g_rs_commits = g_rs_commit_ns = 0;
     pthread_mutex_unlock(&g_res_mu);
 }
