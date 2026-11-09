@@ -10514,8 +10514,19 @@ static id<MTLBuffer> gmem_map(void) {
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
+    // DM_NVN_GMEM_NOBIG (default 1 on iOS, 0 on the Mac; cheemu21's kid-with-sword-remake gmem_nobig): a large pool (BIG_MIN) is not mapped whole for the table; it is listed by the chunks lookups
+    // made and made resident, so only what the GPU reaches through bindings and pointer sites is wired. Mapping Ocarina of Time's 2,432 MB main pool whole at the first raw-access shader (the title
+    // movie's dispatch) made one residency commit wire 2.4 GB of file-backed guest memory at once; on an iPhone 16 Pro Max (8 GB) that commit sat in the kernel (IOGPUResourceGroupUpdateResources)
+    // and never came back in 2 of 6 starts: the picture stopped at the title movie while the audio went on (logs aa12734d, 929da398). A raw read into a part of such a pool nothing has bound reads 0
+    static int nobig = -1; if (nobig < 0) { const char *e = getenv("DM_NVN_GMEM_NOBIG");
+#if TARGET_OS_IPHONE
+        nobig = !e || atoi(e) != 0;
+#else
+        nobig = e && atoi(e) != 0;
+#endif
+        if (nobig) MLOG("raw global memory: large pools are listed by their resident chunks, never wired whole (gmem_nobig; DM_NVN_GMEM_NOBIG=0 wires them whole)"); }
     pthread_mutex_lock(&g_mu);
-    for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
+    if (!nobig) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
     gen = atomic_load(&g_pool_gen); pidx_sort();
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
