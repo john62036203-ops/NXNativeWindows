@@ -10311,10 +10311,11 @@ static id<MTLBuffer> gmem_map(void) {
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
     gen = atomic_load(&g_pool_gen); pidx_sort();
+    NSMutableArray *newres = [NSMutableArray array];   // pools the table makes resident: added and committed in batches below, outside g_mu (gmem_batch)
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!addr_meets(p->lo, p->hi)) continue;
-        if (!p->res) { res_add(p->buf); p->res = 1; g_pool_res_n++; }
+        if (!p->res) { [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
@@ -10331,6 +10332,12 @@ static id<MTLBuffer> gmem_map(void) {
         }
     }
     if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
+    // The pools the table makes resident go into the set in batches of DM_NVN_GMEM_BATCH (default 128), a commit after each, not one commit of them all: the first table on Ocarina of Time adds
+    // about 1,960 pools at the title movie, a commit of 0.7 s when it works, and on an iPhone 16 Pro Max that one kernel call (IOGPUResourceGroupUpdateResources) came back in 3 starts of 6
+    // and never in the other 3 (the picture stopped, the audio went on; logs aa12734d, 929da398, a9c847bd). Smaller commits give the kernel less to do at once; whether that is what hangs it is not known
+    static int batch = -1; if (batch < 0) { const char *e = getenv("DM_NVN_GMEM_BATCH"); batch = e ? atoi(e) : 128; if (batch <= 0) batch = 1 << 30; }
+    { int i = 0; for (id<MTLBuffer> rb in newres) { res_add(rb); if (++i % batch == 0) res_commit(); }
+      static int said; if (!said++ && newres.count) MLOG("raw global memory: %lu pools made resident for the pool table in commits of %d", (unsigned long)newres.count, batch); }
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
