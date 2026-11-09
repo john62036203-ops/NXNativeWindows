@@ -1460,6 +1460,7 @@ static void pass_split_try(void);
 static uint64_t g_setrt_n;   // render target changes so far (pass_split_try: splits per NVN pass)
 static int g_split_resume;   // the pass was split at this draw: it opens again where the dispatch scan already looked (cs_hoist_try)
 static void gmem_commit_patch(void);   // the raw pool table words of the arguments encoded so far follow the pools (gmem_slot_note)
+static void gmem_early(void);
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_skip = 0;
     g_ndve_decoded = nil; g_ndve_skip_end = NULL;
@@ -1472,6 +1473,7 @@ void mtl_sub_begin(void) {
     warm_claim();
     if (g_cb) MDIE("submit re-entered");
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
+    gmem_early();   // the raw pool table, and the residency of the pools it lists, kept up with the pools from the start (below, gmem_map)
     up_idle_release();
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
@@ -10345,6 +10347,21 @@ static id<MTLBuffer> gmem_map(void) {
     return b;
 }
 static uint64_t gmem_map_gpu(void) { return gmem_map().gpuAddress; }
+// DM_NVN_GMEM_EARLY (default 1 on iOS, 0 on the Mac): the pool table is built, and the pools it lists made resident, at the start of every submission whose pools changed, not first at the
+// first raw-access shader. Ocarina of Time's first such shader is the title movie's: its table then made about 1,960 pools resident in one go while the AV1 decoder's pictures were in flight,
+// and on an iPhone 16 Pro Max that residency commit sat in the kernel for good in 4 starts of 8 (the picture stopped, the audio went on; logs aa12734d, 929da398, a9c847bd, 92c0aa47), whole
+// pools or chunks, one commit or commits of 128 alike. Built from the start, the pools go in a few at a time as the game makes them, before the movie, and the table at the movie changes by little
+static void gmem_early(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GMEM_EARLY");
+#if TARGET_OS_IPHONE
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+        if (on) MLOG("raw global memory: the pool table and its pools' residency follow the pools from the first submission (DM_NVN_GMEM_EARLY)"); }
+    if (!on) return;
+    if (!g_gmem_buf || g_gmem_gen != atomic_load(&g_pool_gen)) gmem_map();
+}
 // An argument block holds the pool table that was current when it was encoded. A pool made after that, later in the submission or on another thread while it is encoded, is not in it, and a raw
 // read of that pool gets 0: the failure that hung agl's task shaders (docs/reference/shaders.md, More memory pools than the raw pool table had entries). The GPU has not read the blocks of the
 // command buffer yet, so at each commit, whole or segment, their table words are pointed at a table of the pools as they are then (as #1407 does). A new table is built when the pools changed,
