@@ -333,8 +333,8 @@ void dm_fps_state_apply(void) {
       if (wv && !strcmp(wv, "1") && wa && wend != wa && !*wend && wr >= 1.8f && wr <= 2.6f) {
           uint32_t w1 = (uint32_t)(1440.0f * wr / 16.0f + 0.5f) * 16, w2 = (uint32_t)(1080.0f * wr / 16.0f + 0.5f) * 16, q = (uint32_t)(wr * 65536.0f + 0.5f); float wf = (float)w1;
           memcpy(dm_fps_state + 0x100, &w1, 4); memcpy(dm_fps_state + 0x104, &w2, 4); memcpy(dm_fps_state + 0x108, &wf, 4); memcpy(dm_fps_state + 0x10c, &q, 4);
-          extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(w1, 1440);   // the picture's shape (nvn_mtl.m present_shape); without it the view is laid out 16:9
-          float wcam = (float)w1 / 1440.0f; memcpy(dm_fps_state + 0x110, &wcam, 4);
+          extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(w1, 1440);   // the picture's shape for a texture that follows it (nvn_mtl.m present_shape); without it the view is laid out 16:9
+          float wcam = (float)w1 / 1440.0f; memcpy(dm_fps_state + 0x110, &wcam, 4); float wk = wcam * 9.0f / 16.0f; memcpy(dm_fps_state + 0x114, &wk, 4);   // +0x114: the picture's ratio over 16:9, the scale of the game cameras' own aspect   // +0x110: the 3D view's ratio, the picture's own (patches.py wide_view: a 16:9 camera takes it)
           LOG("%s: wide view: %.3f:1, output %ux1440, handheld %ux1080, camera ratio %.4f (DM_WIDE_VIEW)", g_fps_mod, wr, w1, w2, wcam); }
       else if (wv && !strcmp(wv, "1")) LOG("%s: wide view asked (DM_WIDE_VIEW=1) but the screen's shape %s is not 1.8-2.6:1: kept 16:9", g_fps_mod, wa ? wa : "(unknown)"); }
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
