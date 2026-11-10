@@ -2,10 +2,17 @@
 # Compile every source of the iOS app (host, graphics, libvpx, the iOS front end and win/ios/Launcher.m) for one game profile, without its game files: the Windows
 # counterpart of dm/ios/tools/compile_check.py. Checks that LLVM and the iPhoneOS SDK build the app; Gen/embed.S (the game's rewritten modules) is left out.
 # Usage: win/compile_check.py [game id (default 010015100B514000)] [work folder]
-import sys, tempfile
+import importlib.util, os, sys, tempfile
 from pathlib import Path
 WIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(WIN))
+# The shim (xcrun and the other Mac tools mapped to the Windows ones), in this process and in every Python it starts, as win/build_ipa_windows.py sets it up
+SHIM = WIN / 'pyshim'
+os.environ['PYTHONPATH'] = os.pathsep.join([str(SHIM)] + [p for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p and p != str(SHIM)])
+os.environ.setdefault('PYTHONUTF8', '1')
+if Path(getattr(sys.modules.get('sitecustomize'), '__file__', '') or '').resolve() != (SHIM / 'sitecustomize.py').resolve():
+    _spec = importlib.util.spec_from_file_location('nxw_shim', SHIM / 'sitecustomize.py'); _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
+if str(SHIM) not in sys.path: sys.path.insert(0, str(SHIM))
 import toolchain as tc, build_app as ba
 
 game = sys.argv[1] if len(sys.argv) > 1 else '010015100B514000'
