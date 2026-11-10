@@ -920,8 +920,13 @@ void mtl_pool_addressed(const void *mem, uint64_t size) {
 // (they measured on a 17 Pro Max a 512 MB render-target pool addressed 0 times in a run, with about 530 MB more device wired memory; a 4 GB A14 was ended by the system within seconds of launch because of it).
 // So a pool is not put into the residency set when created; it is put in, and the residency set committed on the spot, the first time the GPU gets its address through mtl_addr / mtl_gpu_addr -- these are the only two ways the GPU gets pool addresses,
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
+static int range_readable(uintptr_t lo, uintptr_t hi);
 static void pool_res(int i) {
     if (g_pools[i].res) { g_pools[i].reg = 1; return; }   // resident already (for the table, say): a binding reaches it now, so it stays
+    // The residency commit below has stayed in the kernel for good a few times (IOGPU's resource-group update: the title movie, logs aa12734d...; entering the game, log 08b7d44b, from
+    // here). Whether such a pool holds pages not mapped readable (memory the game gave back) is not known: said here, before the commit, so the line is in the log if it never returns
+    { static int prot = -1; if (prot < 0) { const char *e = getenv("DM_NVN_GMEM_PROT"); prot = !e || atoi(e); }
+      if (prot && !range_readable(g_pools[i].lo, g_pools[i].end ? g_pools[i].end : g_pools[i].hi)) { static int n; if (n++ < 32) MLOG("[RED] pool %#lx..%#lx made resident for a binding holds pages not mapped readable (%d so far)", (unsigned long)g_pools[i].lo, (unsigned long)(g_pools[i].end ? g_pools[i].end : g_pools[i].hi), n); } }
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++; g_pools[i].reg = 1; g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (g_pools[i].unwired) { g_pools[i].unwired = 0; g_pool_rewired++; }
 }
 // A large pool in chunks. Metal wires a zero-copy buffer whole while it is in the residency set, so one buffer over a large pool pins all of it, whatever the GPU reads. Mario Kart World's 2,427 MB
