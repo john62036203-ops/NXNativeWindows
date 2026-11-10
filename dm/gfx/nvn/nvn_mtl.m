@@ -637,12 +637,32 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; uint64_t used; uint8_t unwired; } pool_ent;   // used: the frame of its last lookup through mtl_addr / mtl_gpu_addr (pool_unwire)   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; uint64_t used; uint8_t unwired;
+                 int reg, gm, gslot, gout; uint64_t gseen, gfence; } pool_ent;   // the raw pool table's on-demand residency (gmem_scan): reg: a binding gave the GPU its address (pool_res), resident for good; gm: resident because a raw access reached it (1; 2 = for good, no access bit was free); gslot: its bit in the access bitmap + 1 (0: none); gout: times taken out for not being reached; gseen: the frame its bit was last seen; gfence: the submission after which the last taking out lets it go   // used: the frame of its last lookup through mtl_addr / mtl_gpu_addr (pool_unwire)   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
 static uint64_t g_pool_adds;
 static int g_pool_res_n;   // registered pools already in the residency set (for the memory readout; under g_mu)
+// Access bits of the raw pool table (gmem_map / gmem_scan, from S2Arm's nvn_mtl.m, Apache-2.0): a pool the table lists but the host has not made resident, or made resident only for the table,
+// gets a bit, which a raw access sets when it chooses the pool's entry (GlobalToStorage.cs Note). Bits belong to pools, not entries, so a rebuilt table loses none set by submissions still running. Under g_mu
+enum { GSLOT_MAX = 65536 };
+static int *g_gslot_pool, *g_gslot_free, g_gslot_nfree, g_gslot_hi;   // bit → pool index (-1: free); freed bits; bits ever given out
+static __strong id<MTLBuffer> g_gbits;   // the bitmap the shaders set (GSLOT_MAX bits), resident
+static int gslot_get(int i) {   // pool i's bit, given out on first use; -1 when all are taken
+    if (g_pools[i].gslot) return g_pools[i].gslot - 1;
+    if (!g_gslot_pool) { g_gslot_pool = malloc(sizeof *g_gslot_pool * GSLOT_MAX); g_gslot_free = malloc(sizeof *g_gslot_free * GSLOT_MAX); if (!g_gslot_pool || !g_gslot_free) MDIE("raw global memory: out of memory for the access bits"); }
+    int b = g_gslot_nfree ? g_gslot_free[--g_gslot_nfree] : g_gslot_hi < GSLOT_MAX ? g_gslot_hi++ : -1;
+    if (b < 0) return -1;
+    g_gslot_pool[b] = i; g_pools[i].gslot = b + 1;
+    return b;
+}
+static void gslot_put(int i) {   // pool i goes: its bit is free again (a submission still running may set it once more: the next pool to get it is then taken as reached, which only makes it resident)
+    int b = g_pools[i].gslot - 1; if (b < 0) return;
+    g_gslot_pool[b] = -1; g_gslot_free[g_gslot_nfree++] = b; g_pools[i].gslot = 0;
+    if (g_gbits) atomic_fetch_and((_Atomic uint32_t *)g_gbits.contents + (b >> 5), ~(1u << (b & 31)));
+}
+static void gslot_moved(int i) { if (g_pools[i].gslot) g_gslot_pool[g_pools[i].gslot - 1] = i; }   // entry i has a new index: its bit follows it
 static uint64_t g_pool_unwired, g_pool_unwired_mb, g_pool_rewired, g_pool_sweeps;   // pool_unwire: pools let go of as idle, their MB, those a lookup put back, sweeps (under g_mu)
 static _Atomic uint64_t g_cur_frame;   // the frame being submitted (nvn_mtl's frame counter, defined with the statistics below)
 static __thread int t_tex_upload_lookup;   // set around a texture upload's read of its storage (pool lookups counted apart, mem_census)
@@ -901,8 +921,8 @@ void mtl_pool_addressed(const void *mem, uint64_t size) {
 // So a pool is not put into the residency set when created; it is put in, and the residency set committed on the spot, the first time the GPU gets its address through mtl_addr / mtl_gpu_addr -- these are the only two ways the GPU gets pool addresses,
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
 static void pool_res(int i) {
-    if (g_pools[i].res) return;
-    res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++; g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (g_pools[i].unwired) { g_pools[i].unwired = 0; g_pool_rewired++; }
+    if (g_pools[i].res) { g_pools[i].reg = 1; return; }   // resident already (for the table, say): a binding reaches it now, so it stays
+    res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++; g_pools[i].reg = 1; g_pools[i].used = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (g_pools[i].unwired) { g_pools[i].unwired = 0; g_pool_rewired++; }
 }
 // A large pool in chunks. Metal wires a zero-copy buffer whole while it is in the residency set, so one buffer over a large pool pins all of it, whatever the GPU reads. Mario Kart World's 2,427 MB
 // graphics pool: the GPU has touched 1,111 MB by the first race, 326 MB of it in the last 1,500 frames; on a 16 GB Mac the driver then spent half its time wiring and unwiring (3.2 s of a 6 s Metal System
@@ -975,8 +995,8 @@ void mtl_pool_del(const void *mem) {
     for (int i = 0; i < g_npool; i++)
         if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_at(b, 0, g_fence + (defer_idle_on() ? sub_open() : 1)); if (g_pools[i].res) g_pool_res_n--;   // no submission open: none can reach it now that it left the table (defer_idle)
             if (!g_dead_pools) g_dead_pools = [NSHashTable weakObjectsHashTable];
-            [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);
-            if (i < g_npool) big_moved(i);   // the entry moved into this place
+            gslot_put(i); [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);
+            if (i < g_npool) { big_moved(i); gslot_moved(i); }   // the entry moved into this place
             if (bg < 0) break;   // a large pool has an entry per chunk
             i--; }
     if (bg >= 0) {
@@ -1017,8 +1037,8 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (i >= 0 && (have >= b->hi || have >= addr + want)) return i;
     int n = big_new(b, lo, lo + BIG_S, end, end >= b->b ? 1 : BIG_UNKNOWN); if (n < 0) return -1;
     if (i >= 0) {   // lengthened: what is encoded with the shorter chunk keeps it, resident, until the pool goes
-        [b->old addObject:g_pools[i].buf]; [g_keep removeObject:g_pools[i].buf]; g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
-        g_pools[i] = g_pools[n]; g_npool--; n = i;
+        [b->old addObject:g_pools[i].buf]; [g_keep removeObject:g_pools[i].buf]; g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--; gslot_put(i);
+        g_pools[i] = g_pools[n]; g_npool--; n = i; gslot_moved(i);
     }
     b->chunk[k] = n + 1;
     return n;
@@ -10317,7 +10337,7 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // Layout (dmsh_abi.h DMSH_GMEM_MAP_*): sorted by start, entry 0 empty, then the pools as disjoint ranges (a pool overlapping an earlier one keeps only its part past that one's end: every
 // pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change; the replaced table goes through
 // deferred release, so submissions encoded with it keep it. Only pools something gave an address in are listed (mtl_pool_addressed), each made resident, as the shader may reach any of them
-static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
+static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen, g_gmem_rgen, g_gmem_built_rgen;   // g_gmem_rgen: the table's residency changed (gmem_scan); built_rgen: what the table holds
 // Whether every page of [lo, hi) is mapped readable. The game gives memory back by making its pages PROT_NONE in the guest files (hle_svc.c guest_release, SetHeapSize, the alias region's
 // unmaps), while the pool objects over them stay registered and addressed; wiring such a pool's zero-copy buffer for the pool table is what sat in the kernel for good on an iPhone 16 Pro Max
 // (IOGPUResourceGroupUpdateResources in res_commit from gmem_map, 5 starts of 12: logs aa12734d, 929da398, a9c847bd, 046de7b5, 8271a5c0; whole pools or chunks, one commit or batches, at
@@ -10333,49 +10353,118 @@ static int range_readable(uintptr_t lo, uintptr_t hi) {
     return 1;
 }
 static uint64_t g_gmem_unmapped;   // pools the table left out for a page not mapped readable (cumulative, for the log line)
+static int gmem_readable(pool_ent *p) { static int prot = -1; if (prot < 0) { const char *e = getenv("DM_NVN_GMEM_PROT"); prot = !e || atoi(e); } return !prot || range_readable(p->lo, p->hi); }
+// On-demand residency of the raw pool table (from S2Arm's nvn_mtl.m gmem_scan, Apache-2.0; nxnative made every listed pool resident). A shader may reach any listed pool, and the GPU must
+// never touch memory outside the residency set, so the table itself is the gate: an entry is usable only while its pool is resident. A pool not resident gets a cold entry {start, start, its
+// true end}, which the shader's search takes for no pool (reads 0, its writes are dropped), and the access sets the pool's bit in the access bitmap (g_gbits, its address in entry 0's delta
+// words; the bit + 1 in the entry's last word; GlobalToStorage.cs Note). Before the next submission's encoding uses the table, gmem_scan makes each such pool resident and commits the
+// residency set, then the table is rebuilt with its entry usable: nothing the GPU runs reaches a pool before the residency commit that holds it. The first submission that reaches a pool
+// reads 0 there, as a texture handle seen the first time reads the dummy texture (pool_seen_scan). A pool the table made resident keeps its bit in its usable entry: a raw access that
+// chooses the entry sets it, and one not reached for GAGE_BASE frames (doubled for each time it was taken out before, at most 2^GAGE_SHIFT_MAX times) is taken out: its entry turns cold
+// at once, the residency set lets it go only when the submission that may still have used the usable entry has completed (gfence). A pool a binding gave the GPU the address of
+// (reg, pool_res) is resident for good and never tracked. Ocarina of Time on an 8 GB iPhone 16 Pro Max held 4,300 pools and chunks (2.2 GB) wired by the Kokiri Forest, 3,760 of them
+// only for the table (log bb6a10dd); S2Arm on a 17 Pro Max: 23.8 fps with every pool resident, 35.8 with the reached ones. DM_NVN_GMEM_ONDEMAND=0 makes every listed pool resident as before
+enum { GAGE_BASE = 300, GAGE_SHIFT_MAX = 4, GAGE_CHECK = 60, GSTAT_EVERY = 300 };   // frames
+static int gmem_ondemand(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_ONDEMAND"); v = !e || atoi(e); MLOG("raw global memory: pools %s (DM_NVN_GMEM_ONDEMAND)", v ? "resident once a raw access reaches them, let go when not reached for a while" : "all resident while listed"); } return v; }
+static NSMutableArray *g_gout_q;   // pools taken out of the table, waiting for g_done to pass their gfence: @[buffer, fence]
+static uint64_t g_gscan_sub = ~0ull, g_gage_at, g_gstat_at, g_gm_in, g_gm_out, g_gm_rm;   // g_gm_*: made resident / taken out of the table / left the residency set, since the last readout
+// Reads and clears the access bits the shaders set, makes the pools they name resident, ages the pools the table made resident, lets go of those taken out whose last submission has
+// completed. Once a submission, before its first table binding (gmem_map). Caller holds g_mu; returns whether the residency set changed (the caller commits it outside g_mu)
+static int gmem_scan(void) {
+    if (!g_gbits) return 0;
+    uint64_t now = atomic_load(&g_cur_frame), done = g_done; int added = 0, changed = 0, removed = 0;
+    if (g_gout_q.count) {
+        NSMutableArray *keep = [NSMutableArray array];
+        for (NSArray *o in g_gout_q) {
+            if ([o[1] unsignedLongLongValue] > done) { [keep addObject:o]; continue; }
+            id<MTLBuffer> b = o[0];
+            for (int i = 0; i < g_npool; i++) if (g_pools[i].buf == b) { pool_ent *p = &g_pools[i];   // a pool gone since went out through its own deferred release
+                if (p->res && !p->reg && !p->gm && p->gfence <= done) { res_remove(p->buf); p->res = 0; g_pool_res_n--; removed++; g_gm_rm++; }   // reached again, or taken out again later: not yet
+                break; }
+        }
+        g_gout_q = keep;
+    }
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_gbits.contents;
+    for (int k = 0; k < (g_gslot_hi + 31) / 32; k++) {
+        uint32_t bits = atomic_load_explicit(w + k, memory_order_relaxed);
+        if (!bits) continue;
+        atomic_fetch_and_explicit(w + k, ~bits, memory_order_relaxed);
+        for (; bits; bits &= bits - 1) {
+            int i = g_gslot_pool[k * 32 + __builtin_ctz(bits)]; if (i < 0) continue;
+            pool_ent *p = &g_pools[i]; p->gseen = now;
+            if (p->reg || p->gm) continue;
+            if (!p->res) { if (!gmem_readable(p)) { g_gmem_unmapped++; continue; } res_add(p->buf); p->res = 1; g_pool_res_n++; added++; }   // released memory under it: stays cold (range_readable)
+            p->gm = 1; changed++; g_gm_in++;
+        }
+    }
+    if (now - g_gage_at >= GAGE_CHECK) { g_gage_at = now;
+        for (int i = 0; i < g_npool; i++) { pool_ent *p = &g_pools[i];
+            if (p->gm != 1 || p->reg || now - p->gseen <= (uint64_t)GAGE_BASE << MIN(p->gout, GAGE_SHIFT_MAX)) continue;
+            p->gm = 0; p->gout++; p->gfence = g_fence + 1; changed++; g_gm_out++;   // this submission may have bound a table with it usable
+            if (!g_gout_q) g_gout_q = [NSMutableArray array];
+            [g_gout_q addObject:@[p->buf, @(p->gfence)]];
+        } }
+    if (changed) g_gmem_rgen++;
+    if (now - g_gstat_at >= GSTAT_EVERY) { g_gstat_at = now;
+        int n = 0; uint64_t mb = 0; for (int i = 0; i < g_npool; i++) if (g_pools[i].gm && !g_pools[i].reg) { n++; mb += g_pools[i].hi - g_pools[i].lo; }
+        if (g_gm_in || g_gm_out || g_gm_rm) MLOG("raw global memory: %d pools resident for the pool table (%llu MB); last %d frames: %llu reached and made resident, %llu not reached for long and taken out, %llu left the residency set",
+            n, (unsigned long long)(mb >> 20), GSTAT_EVERY, (unsigned long long)g_gm_in, (unsigned long long)g_gm_out, (unsigned long long)g_gm_rm);
+        g_gm_in = g_gm_out = g_gm_rm = 0; }
+    return added || removed;
+}
 static id<MTLBuffer> gmem_map(void) {
+    int ondemand = gmem_ondemand();
+    if (ondemand && g_gscan_sub != g_sub_serial) { g_gscan_sub = g_sub_serial; pthread_mutex_lock(&g_mu); int commit = gmem_scan(); pthread_mutex_unlock(&g_mu); if (commit) res_commit(); }
     uint64_t gen = atomic_load(&g_pool_gen);
-    if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
+    if (g_gmem_buf && g_gmem_gen == gen && g_gmem_built_rgen == g_gmem_rgen) return g_gmem_buf;
     id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
-    int n = 1, over = 0; uint64_t end = 0;
+    int n = 1, over = 0, cold = 0, nobit = 0; uint64_t end = 0;
     pthread_mutex_lock(&g_mu);
+    if (ondemand && !g_gbits) { g_gbits = [g_dev newBufferWithLength:GSLOT_MAX / 8 options:MTLResourceStorageModeShared]; if (!g_gbits) MDIE("raw global memory: failed to create the access bitmap"); memset(g_gbits.contents, 0, GSLOT_MAX / 8); res_add(g_gbits); }
+    if (ondemand) { uint64_t ba = g_gbits.gpuAddress; memcpy(t + 16, &ba, sizeof ba); }   // entry 0's delta words: the access bitmap (entry 0 ends where it starts and its state is 0: nothing notes it)
     for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
-    gen = atomic_load(&g_pool_gen); pidx_sort();
-    NSMutableArray *newres = [NSMutableArray array];   // pools the table makes resident: added and committed in batches below, outside g_mu (gmem_batch)
+    gen = atomic_load(&g_pool_gen); uint64_t rgen = g_gmem_rgen; pidx_sort();
+    NSMutableArray *newres = [NSMutableArray array];   // pools the table makes resident whatever the access bits say: added and committed below, outside g_mu
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!addr_meets(p->lo, p->hi)) continue;
-        if (!p->res) { static int prot = -1; if (prot < 0) { const char *e = getenv("DM_NVN_GMEM_PROT"); prot = !e || atoi(e); }
-            if (prot && !range_readable(p->lo, p->hi)) { g_gmem_unmapped++; continue; }   // released memory under a registered pool: not listed, not wired (above)
-            [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
-        uint64_t e[3] = {lo, hi, p->gpu - p->base}; memcpy(t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY, e, sizeof e); end = hi;
+        int usable = 1; uint32_t state = 0;
+        if (ondemand) {
+            usable = p->reg || p->gm; int bit = p->reg || p->gm == 2 ? -1 : gslot_get(g_pidx[k]);   // a bit: not resident, or resident only while reached
+            if (!usable && bit < 0) { if (!p->res) { if (!gmem_readable(p)) { g_gmem_unmapped++; continue; } [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; } p->gm = 2; usable = 1; nobit++; }   // no bit left to learn whether it is reached: resident for good
+            state = bit >= 0 ? (uint32_t)bit + 1 : 0;
+        } else if (!p->res) {
+            if (!gmem_readable(p)) { g_gmem_unmapped++; continue; }   // released memory under a registered pool: not listed, not wired (range_readable)
+            [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; }
+        uint64_t e[3] = {lo, usable ? hi : lo, usable ? p->gpu - p->base : hi};   // a cold entry: ends where it starts, its true end in the delta words
+        memcpy(t + (size_t)n * DMSH_GMEM_MAP_ENTRY, e, sizeof e); memcpy(t + (size_t)n * DMSH_GMEM_MAP_ENTRY + 28, &state, sizeof state); n++; end = hi; cold += !usable;
     }
+    g_gmem_built_rgen = rgen;
     pthread_mutex_unlock(&g_mu);
-    // Each 2 MiB chunk wholly inside an entry gets a hint, so most accesses skip the binary search. A colliding chunk replaces the hint and the shader's tag check sends the other to the search
+    // Each 2 MiB chunk wholly inside an entry (a cold one's true range) gets a hint, so most accesses skip the binary search. A colliding chunk replaces the hint and the shader's tag check sends the other to the search
     for (int k = 1; k < n; k++) {
         const uint64_t *e = (const uint64_t *)(t + (size_t)k * DMSH_GMEM_MAP_ENTRY);
-        uint64_t size = 1ull << DMSH_GMEM_HINT_SHIFT, first = (e[0] + size - 1) >> DMSH_GMEM_HINT_SHIFT, last = e[1] >> DMSH_GMEM_HINT_SHIFT;
+        uint64_t hi = e[1] > e[0] ? e[1] : e[2];
+        uint64_t size = 1ull << DMSH_GMEM_HINT_SHIFT, first = (e[0] + size - 1) >> DMSH_GMEM_HINT_SHIFT, last = hi >> DMSH_GMEM_HINT_SHIFT;
         for (uint64_t c = first; c < last && c < (1ull << (32 - 13)); c++) {
             uint32_t hint = (uint32_t)(c << 13 | (unsigned)k);
             memcpy(t + (size_t)(c % DMSH_GMEM_MAP_ENTRIES) * DMSH_GMEM_MAP_ENTRY + 24, &hint, sizeof hint);
         }
     }
     if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
-    // The pools the table makes resident go into the set in batches of DM_NVN_GMEM_BATCH (default 128), a commit after each, not one commit of them all: the first table on Ocarina of Time adds
-    // about 1,960 pools at the title movie, a commit of 0.7 s when it works, and on an iPhone 16 Pro Max that one kernel call (IOGPUResourceGroupUpdateResources) came back in 3 starts of 6
-    // and never in the other 3 (the picture stopped, the audio went on; logs aa12734d, 929da398, a9c847bd). Smaller commits give the kernel less to do at once; whether that is what hangs it is not known
-    static int batch = -1; if (batch < 0) { const char *e = getenv("DM_NVN_GMEM_BATCH"); batch = e ? atoi(e) : 0; if (batch <= 0) batch = 1 << 30; }   // default one commit (batches of 128 did not stop the hang either, log a9c847bd)
+    if (nobit) { static int said; if (!said++) MLOG("[RED] raw global memory: the %d access bits are all taken: %d pools made resident without being reached", GSLOT_MAX, nobit); }
+    static int batch = -1; if (batch < 0) { const char *e = getenv("DM_NVN_GMEM_BATCH"); batch = e ? atoi(e) : 0; if (batch <= 0) batch = 1 << 30; }
     { int i = 0; for (id<MTLBuffer> rb in newres) { res_add(rb); if (++i % batch == 0) res_commit(); }
       static int said; if (!said++ && newres.count) MLOG("raw global memory: %lu pools made resident for the pool table in commits of %d", (unsigned long)newres.count, batch); }
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
-    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes; %llu pools left out so far for a page not mapped readable", n - 1, (unsigned long long)gen, (unsigned long long)g_gmem_unmapped); }
+    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges, %d of them cold (pool generation %llu), rebuilt whenever a pool comes or goes or its residency changes; %llu pools left out so far for a page not mapped readable", n - 1, cold, (unsigned long long)gen, (unsigned long long)g_gmem_unmapped); }
     return b;
 }
 static uint64_t gmem_map_gpu(void) { return gmem_map().gpuAddress; }

@@ -1006,7 +1006,37 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.Store(StorageKind.LocalMemory, lastBinding, selected);
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
             Operand lblSkip = Label();
-            context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
+            Operand lblHeld = Label();
+
+            // The host keeps pools resident only while raw accesses reach them (nvn_mtl.m gmem_scan, from S2Arm): the entry's last word is the pool's bit in the access bitmap + 1
+            // (0: none), the bitmap's address is in entry 0's delta words. Read first: a bit is set once, and the atomic is the rare path
+            void Note(Operand state)
+            {
+                Operand lblNoted = Label();
+                context.BranchIfTrue(lblNoted, context.ICompareEqual(state, Const(0)));
+                Operand bitIndex = context.ISubtract(state, Const(1));
+                Operand bitLow = context.IAdd(MapWord(Const(0), 4), context.ShiftLeft(context.ShiftRightU32(bitIndex, Const(5)), Const(2)));
+                Operand bitHigh = context.IAdd(MapWord(Const(0), 5), context.ConditionalSelect(context.ICompareLessUnsigned(bitLow, MapWord(Const(0), 4)), Const(1), Const(0)));
+                Operand bitMask = context.ShiftLeft(Const(1), context.BitwiseAnd(bitIndex, Const(31)));
+                context.BranchIfTrue(lblNoted, context.ICompareNotEqual(context.BitwiseAnd(context.Load(StorageKind.GlobalMemory, bitLow, bitHigh), bitMask), Const(0)));
+                context.AtomicOr(StorageKind.GlobalMemory, bitLow, bitHigh, bitMask);
+                context.MarkLabel(lblNoted);
+            }
+
+            context.BranchIfTrue(lblHeld, Below(MapWord(found, 3), MapWord(found, 2)));
+
+            // An address in no pool (the entry below it ends below it), or in a pool not resident: a cold entry ends where it starts and its delta words hold its true end. The access
+            // notes the pool for the host and is skipped like one in no pool (reads 0)
+            Operand cold = context.BitwiseAnd(
+                context.BitwiseAnd(context.ICompareEqual(MapWord(found, 2), MapWord(found, 0)), context.ICompareEqual(MapWord(found, 3), MapWord(found, 1))),
+                Below(MapWord(found, 5), MapWord(found, 4)));
+            context.BranchIfFalse(lblSkip, cold);
+            Note(MapWord(found, 7));
+            context.Branch(lblSkip);
+
+            // The hint's or the search's entry holds it: noted when an invocation chooses it (the accesses that take the last entry's range follow one that was)
+            context.MarkLabel(lblHeld);
+            Note(MapWord(found, 7));
 
             // The last entry's range held it, or the hint's or the search's entry does
             context.MarkLabel(lblChosen);
