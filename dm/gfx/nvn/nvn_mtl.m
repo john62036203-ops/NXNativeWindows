@@ -10360,7 +10360,7 @@ static id<MTLBuffer> gmem_map(void) {
     // The pools the table makes resident go into the set in batches of DM_NVN_GMEM_BATCH (default 128), a commit after each, not one commit of them all: the first table on Ocarina of Time adds
     // about 1,960 pools at the title movie, a commit of 0.7 s when it works, and on an iPhone 16 Pro Max that one kernel call (IOGPUResourceGroupUpdateResources) came back in 3 starts of 6
     // and never in the other 3 (the picture stopped, the audio went on; logs aa12734d, 929da398, a9c847bd). Smaller commits give the kernel less to do at once; whether that is what hangs it is not known
-    static int batch = -1; if (batch < 0) { const char *e = getenv("DM_NVN_GMEM_BATCH"); batch = e ? atoi(e) : 128; if (batch <= 0) batch = 1 << 30; }
+    static int batch = -1; if (batch < 0) { const char *e = getenv("DM_NVN_GMEM_BATCH"); batch = e ? atoi(e) : 0; if (batch <= 0) batch = 1 << 30; }   // default one commit (batches of 128 did not stop the hang either, log a9c847bd)
     { int i = 0; for (id<MTLBuffer> rb in newres) { res_add(rb); if (++i % batch == 0) res_commit(); }
       static int said; if (!said++ && newres.count) MLOG("raw global memory: %lu pools made resident for the pool table in commits of %d", (unsigned long)newres.count, batch); }
     res_add(b); res_commit();
@@ -10375,12 +10375,7 @@ static uint64_t gmem_map_gpu(void) { return gmem_map().gpuAddress; }
 // and on an iPhone 16 Pro Max that residency commit sat in the kernel for good in 4 starts of 8 (the picture stopped, the audio went on; logs aa12734d, 929da398, a9c847bd, 92c0aa47), whole
 // pools or chunks, one commit or commits of 128 alike. Built from the start, the pools go in a few at a time as the game makes them, before the movie, and the table at the movie changes by little
 static void gmem_early(void) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GMEM_EARLY");
-#if TARGET_OS_IPHONE
-        on = !e || atoi(e) != 0;
-#else
-        on = e && atoi(e) != 0;
-#endif
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GMEM_EARLY"); on = e && atoi(e) != 0;   // off by default again: it moved the hang to the first submission (log 8271a5c0) and did not stop it
         if (on) MLOG("raw global memory: the pool table and its pools' residency follow the pools from the first submission (DM_NVN_GMEM_EARLY)"); }
     if (!on) return;
     if (!g_gmem_buf || g_gmem_gen != atomic_load(&g_pool_gen)) gmem_map();
@@ -10545,6 +10540,8 @@ static void tex_cold_retire(uint64_t frame) { @autoreleasepool {
     typedef struct { uint64_t serial; alias_key k; int id_; } cold_t; cold_t *cs = NULL; uint32_t n = 0, cap = 0; uint64_t bytes = 0; unsigned stamped = 0, kept_rt = 0, kept_buf = 0;
     os_unfair_lock_lock(&g_rmu);
     g_cold_sweeps++;
+    // 0) how many IDs a draw bound directly in the last period (tex_touch), before the bitmap's stamps join them
+    unsigned direct = 0; for (int id_ = 1; id_ < g_ntreg; id_++) if (g_seen_at[id_] && (uint64_t)g_seen_at[id_] + 300 > frame) direct++;
     // 1) stamp the IDs read since the last sweep and clear the GPU's words (not g_seen_done: a texture made because it was read stays made)
     _Atomic uint32_t *w = (_Atomic uint32_t *)g_seen_buf.contents; unsigned words = MIN((unsigned)g_ntreg / 32 + 1, (unsigned)POOL_SEEN_WORDS);
     for (unsigned i = 0; i < words; i++) { uint32_t bits = atomic_exchange(w + i, 0); for (; bits; bits &= bits - 1) { g_seen_at[i * 32 + __builtin_ctz(bits)] = stamp; stamped++; } }
@@ -10573,8 +10570,8 @@ static void tex_cold_retire(uint64_t frame) { @autoreleasepool {
         g_ser_gen++; pthread_mutex_unlock(&g_smu);
         g_cold_retired += dropped; g_cold_retired_mb += bytes >> 20; }
     free(cs);
-    MLOG("cold textures at frame %llu: %u IDs read in the last sweep (%u more named by handle tables); %u IDs (%u textures, %llu MB) not read for %lld s retired until their next read; kept %u render targets, %u over buffers; in all %llu textures (%llu MB) in %llu sweeps",
-         (unsigned long long)frame, stamped, tabled, n, dropped, (unsigned long long)(bytes >> 20), (long long)cold_s, kept_rt, kept_buf, (unsigned long long)g_cold_retired, (unsigned long long)g_cold_retired_mb, (unsigned long long)g_cold_sweeps);
+    MLOG("cold textures at frame %llu: %u IDs bound directly, %u read through a pool in the last sweep (%u more named by handle tables); %u IDs (%u textures, %llu MB) not read for %lld s retired until their next read; kept %u render targets, %u over buffers; in all %llu textures (%llu MB) in %llu sweeps",
+         (unsigned long long)frame, direct, stamped, tabled, n, dropped, (unsigned long long)(bytes >> 20), (long long)cold_s, kept_rt, kept_buf, (unsigned long long)g_cold_retired, (unsigned long long)g_cold_retired_mb, (unsigned long long)g_cold_sweeps);
 } }
 static uint64_t htab_gpu(int stage, const nvn_rbind *b, __unsafe_unretained id<MTLBuffer> *out) {
     int samp = b->kind == NVN_RB_SAMPH, reg = b->reg;
