@@ -3169,7 +3169,7 @@ static unsigned tex_drop_of(const tex_t *t, id<MTLTexture> mt) {   // the levels
 static uint64_t g_stat_drop_skips;
 static int tex_drop_ok(const tex_t *t, id<MTLTexture> mt, const char *what) {   // a guest-level operation on a host texture made without its largest levels: skipped
     if (!tex_drop_of(t, mt)) return 1;
-    g_stat_drop_skips++; RED_ONCE(162, "%s on a texture made without its largest levels (DM_TEX_MIP_DROP): skipped (first case ser=%llu %ux%u format %#x)", what, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+    g_stat_drop_skips++; RED_ONCE(160, "%s on a texture made without its largest levels (DM_TEX_MIP_DROP): skipped (first case ser=%llu %ux%u format %#x)", what, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
     return 0;
 }
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
