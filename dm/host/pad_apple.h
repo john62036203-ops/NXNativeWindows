@@ -7,6 +7,7 @@
 #pragma once
 #import <GameController/GameController.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "dm_input.h"
 
 static inline int dm_pad_labelled(GCController *c) {
@@ -17,5 +18,8 @@ static inline int dm_pad_labelled(GCController *c) {
 static inline uint64_t dm_pad_face(GCExtendedGamepad *g) {
     GCControllerButtonInput *a = g.buttonA, *b = g.buttonB, *x = g.buttonX, *y = g.buttonY;
     if (!dm_pad_labelled(g.controller)) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; }   // by position: right A, bottom B, top X, left Y
+    // DM_PAD_SWAP_FACE=1: A and B, and X and Y, change places once more: a pad that presents itself as a Switch Pro Controller but is printed the other way round (A at the bottom)
+    { static int swap = -1; if (swap < 0) { const char *e = getenv("DM_PAD_SWAP_FACE"); swap = e && atoi(e) != 0; }
+      if (swap) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; } }
     return (a.isPressed ? DM_BTN_A : 0) | (b.isPressed ? DM_BTN_B : 0) | (x.isPressed ? DM_BTN_X : 0) | (y.isPressed ? DM_BTN_Y : 0);
 }
