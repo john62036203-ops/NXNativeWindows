@@ -554,11 +554,22 @@ SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': 
 def record_index(path):   # → (an open descriptor, {a record's key: its bytes' (start, end)}): shader_split.py writes each record's key at +0x08, its bytes from its marker to the next one
     # Scanned through a read-only mapping that is closed again, so no package stays in this process. Pokopia's ps_rdb.bin (4.25 GB) read and cut into its 105,118
     # records left the process at 8.7 GB, and each fork (every spirv-cross and Metal compile) then took 75 ms instead of 3 with the GIL held: one shader worker at a time (GitHub issue #1036)
-    fd = os.open(path, os.O_RDONLY); n = os.fstat(fd).st_size
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0)); n = os.fstat(fd).st_size
     if not n: return fd, {}
     with mmap.mmap(fd, n, access=mmap.ACCESS_READ) as m:
         offs = [x.start() for x in re.finditer(b'BTCDBTCD', m)] + [n]
         return fd, {m[o + 8:o + 16].hex(): (o, e) for o, e in zip(offs, offs[1:])}
+
+_pread_lock = threading.Lock()
+def pread(fd, n, off):   # os.pread, which Windows' Python does not have: a seek and read under one lock, the descriptor being shared by the workers
+    if hasattr(os, 'pread'): return os.pread(fd, n, off)
+    with _pread_lock:
+        os.lseek(fd, off, os.SEEK_SET); out = bytearray()
+        while len(out) < n:
+            b = os.read(fd, n - len(out))
+            if not b: break
+            out += b
+        return bytes(out)
 
 def clone(src, dst):   # APFS copy-on-write, else a plain copy; the clonefile call, not a cp: a fork of this large process costs about 6 ms
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1245,6 +1256,7 @@ def reflect(key, stage, msl, res):
             off = b['cb_offset'] * 4 if b and b['cb_slot'] == 0 else None
             if b and b['cb_slot'] == abi.GMEM_MAP_CB_SLOT:   # not a game buffer: for addresses traced to no storage buffer, the host's pool table (offset 0) or the write log (DMSH_GMEM_LOG_CB_OFFSET)
                 if b['cb_offset'] == abi.GMEM_LOG_CB_OFFSET: e.update(kind=abi.KIND_GMEM_LOG, rw=True); continue
+                if b['cb_offset'] == abi.GPTR_CB_OFFSET: e.update(kind=abi.KIND_GPTR, rw=False, sites=gptr_sites(stage, res)); continue
                 # rw: one of those accesses writes (the translator notes each one with its operation: Load, Store or an atomic)
                 e.update(kind=abi.KIND_GMEM_MAP, rw=any(re.search(r'operation "(Store|Atomic\w*)" traced to no storage buffer', n) for n in res.get('notes', ()))); continue
             if stage == 'cs' and off is not None and abi.C0_CS_UBO <= off < abi.C0_CS_UBO + abi.C0_ROW * abi.C0_CS_UBO_SLOTS and (off - abi.C0_CS_UBO) % abi.C0_ROW == 0:
@@ -1254,6 +1266,23 @@ def reflect(key, stage, msl, res):
             else: e['reg'] = (off - base) // abi.C0_ROW if off is not None and base is not None and 0 <= off - base < abi.C0_ROW * abi.C0_SSBO_SLOTS and (off - base) % abi.C0_ROW == 0 else None
             e['rw'] = bool(b and b['flags'] & 1)   # BufferUsageFlags.Write; Program.cs serializes the translator enum unchanged (atomics count as writes too)
     return binds
+
+_GPTR_SITE = re.compile(r'translator: gptr site (\d+): c(\d+)\[(\d+)\] \+(\d+)$')
+
+def gptr_sites(stage, res):
+    """The shader's bind-time pointer sites (dmsh_abi.h DMSH_GPTR_*), in site order: [NVN storage buffer slot, byte offset of the pointer word]. A site whose storage buffer
+    the host does not take by slot (its address in no c0 storage buffer row) gets slot -1: the host leaves its entry empty and the shader searches the table"""
+    sites = {}
+    base = SSBO.get(stage)
+    for n in res.get('notes', ()):
+        m = _GPTR_SITE.match(n)
+        if not m: continue
+        k, cb_slot, cb_word, byte = map(int, m.groups())
+        off = cb_word * 4
+        reg = (off - base) // abi.C0_ROW if cb_slot == 0 and base is not None and 0 <= off - base < abi.C0_ROW * abi.C0_SSBO_SLOTS and (off - base) % abi.C0_ROW == 0 else -1
+        sites[k] = [reg, byte]
+    if sorted(sites) != list(range(len(sites))) or len(sites) > abi.GPTR_MAX: raise ValueError(f'gptr sites {sorted(sites)} are not 0..n-1 within {abi.GPTR_MAX}')
+    return [sites[k] for k in range(len(sites))]
 
 DRV_FILL = {0: [(b, b + abi.C0_ROW * abi.C0_SSBO_SLOTS) for k, b in sorted(SSBO.items(), key=lambda kv: kv[1]) if k not in ('ts', 'ms')],   # c0: storage buffer address tables (vertex / compute / geometry / pixel; a task or mesh stage's: unfillable())
             2: [(TEX_BASE, SEPTEX_BASE), (IMG_BASE, IMG_BASE + abi.C2_ROW * IMG_SLOTS), (SEPTEX_BASE, SAMP_BASE), (SAMP_BASE, SAMP_BASE + abi.C2_ROW * abi.C2_SEP_SLOTS)]}   # c2: the handle tables above, all filled by the replay layer
@@ -1916,7 +1945,7 @@ def rec_of(key):
         sys.exit(f'[RED] {name} holds no record of shader {key}, which the shader map names: the package and the map come from different shader_split.py runs{old}; '
                  f'split the shaders again (the NSP script does when {dm_dir} is removed)')
     o, e = recs[key]
-    return name, os.pread(fd, e - o, o)
+    return name, pread(fd, e - o, o)
 for key in keys: digests[key] = shader_key(key, *rec_of(key))
 def plain_digest(k):   # a paired pixel shader's key, also when it is not built this time
     if k in digests: return digests[k]
