@@ -114,6 +114,12 @@ class Registry(unittest.TestCase):
                 self.assertTrue(rules); self.assertEqual(len({r['name'] for r in rules}), 1, f'{p}: a main has one frame step')
                 for rule in rules:
                     validate_stub(rule)
+                    if 'calls' in rule:   # anchored: with each reviewed result of its find, the stub writes at the function's start plus the offset it found
+                        for found in rule['reviewed']:
+                            sites, _, _, _ = docs_patches.frame_step_sites(rule['stub'], base=0x100000, found=found)
+                            self.assertTrue(sites, f'{p}: {rule["name"]} writes no site')
+                            self.assertTrue(all(0x100000 <= off < 0x100000 + 0x100000 for off, _ in sites), f'{p}: {rule["name"]} writes outside its function')
+                        continue
                     sites, _, in_others, _ = docs_patches.frame_step_sites(rule['stub'], base=0x100000, others=rule.get('others', {}))
                     self.assertTrue(sites, f'{p}: {rule["name"]} writes no site')
                     for off, why in sites: self.assertTrue(0x100000 <= off < 0x100000 + rule['size'], f'{p}: {rule["name"]} site {off:#x} outside its function')
@@ -185,6 +191,16 @@ class ExternalRegistry(unittest.TestCase):
         (self.tools / 'engine_patches.py').write_text("MATCH_CUTS = {'main': ['engine rule'], 'sdk': ['engine sdk rule']}\n")
         tables, _ = self.registry()
         self.assertEqual(tables['SDK_MATCH_CUTS'], {'sdk': ['sdk rule', 'engine sdk rule'], 'main': ['engine rule']})
+
+    def test_repository_patches_under_bracketed_directory(self):
+        tools = self.tmp / 'game [0400486024DEC000][v131072]' / 'dm/tools'; tools.mkdir(parents=True)
+        for f in ('sdk_patches.py', 'engine_patches.py'): (tools / f).write_text('')
+        bid = '6a' * 16
+        patch = self.patch_file(tools.parent / 'games', f"FRAME_STEP = {{'{bid}': lambda ctx: None}}\n")
+        with mock.patch.object(self, 'tools', tools):
+            tables, where = self.registry()
+        self.assertIn(bid, tables['FRAME_STEP'])
+        self.assertEqual(Path(where['FRAME_STEP', bid]).resolve(), patch.resolve())
 
     def test_derived_profile_keeps_repository_match_rules(self):
         self.patch_file(self.tools.parent / 'games', "MATCH_CUTS = {'main': ['repository']}\n")
