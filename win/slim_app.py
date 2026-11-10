@@ -12,14 +12,16 @@ from pathlib import Path
 WIN = Path(__file__).resolve().parent
 REPO = WIN.parent
 GAME = '0400486024DEC000'
-SRC_IPA = Path(r'C:\Games\OoT\OoT-slim-x.ipa')
-OUT = Path(r'C:\Games\OoT\OoT-slim-x4.ipa')
-OUT_CLEAN = Path(r'C:\Games\OoT\OoT-slim-x4-clean.ipa')
+# NXW_SLIM_TAG=<tag> names the build: shaders from OoT-slim-<NXW_SLIM_SRC>.ipa (x), output OoT-slim-<tag>.ipa / -clean.ipa, work folder slim<tag>_work
+_TAG = os.environ.get('NXW_SLIM_TAG', 'x4'); _SRC = os.environ.get('NXW_SLIM_SRC', 'x')
+SRC_IPA = Path(rf'C:\Games\OoT\OoT-slim-{_SRC}.ipa')
+OUT = Path(rf'C:\Games\OoT\OoT-slim-{_TAG}.ipa')
+OUT_CLEAN = Path(rf'C:\Games\OoT\OoT-slim-{_TAG}-clean.ipa')
 EXEFS = Path(r'C:\Games\OoT\build\extract\v131072\ExeFS')
 OLD_ROMFS = EXEFS.parent / 'RomFS.img'           # the old dump, unpacked by the builds: OoT-slim.ipa's romfs.id
 CLEAN_ROMFS = Path(r'C:\OOT-A12\RomFS.img')
 ICON = EXEFS.parent / 'icon.jpg'
-WORK = Path(r'C:\Games\OoT\slimx4_work')
+WORK = Path(rf'C:\Games\OoT\slim{_TAG}_work')
 MAIN_WIN = Path(r'D:\nxw\win')
 BUNDLE = 'org.nxnativewindows.0400486024dec000'   # OoT-slim.ipa's: the same data folder on the phone (RomFS.img, saves)
 ID_NAME = 'Payload/DmIOS.app/romfs.id'
