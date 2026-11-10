@@ -3147,6 +3147,31 @@ static int tex_atomic_alias(id<MTLTexture> base) {
         || pf == MTLPixelFormatRG16Unorm || pf == MTLPixelFormatRG16Snorm || pf == MTLPixelFormatRG16Uint || pf == MTLPixelFormatRG16Sint || pf == MTLPixelFormatRG16Float || pf == MTLPixelFormatR32Float;
     return bytes32 && (base.textureType == MTLTextureType2D || base.textureType == MTLTextureType2DArray) && base.sampleCount == 1 && base.storageMode == MTLStorageModePrivate && !base.buffer && !base.isSparse;
 }
+// DM_TEX_MIP_DROP=<n> (0, off, by default), DM_TEX_MIP_DROP_MIN=<pixels> (512): a packaged texture (uploaded from the game's storage, pkg_upload_) that is 2D, block-compressed, of at
+// least n + 3 levels and at least MIN pixels on each side is made without its n largest levels: level n of the game's is level 0 of the host's, so sampling starts there and the texture
+// takes about 1/4^n of the memory. Ocarina of Time holds 1.5 GB of private textures on an iPhone 16 Pro Max (log e077ed8e), most of it the largest level of its material textures,
+// which its 0.25 render scale never resolves anyway. Not render targets, not textures the CPU writes in place (linear), not textures in sparse pools (their tiles follow the page table).
+// A guest copy into or out of such a texture, and a view starting below level n, cannot be mapped onto the host texture: the copy is skipped (tex_drop_ok), the view starts at level 0
+static int g_mip_drop = -1, g_mip_drop_min;
+static int mip_drop(void) { if (g_mip_drop < 0) { const char *e = getenv("DM_TEX_MIP_DROP"); g_mip_drop = e ? MAX(0, MIN(atoi(e), 4)) : 0; const char *m = getenv("DM_TEX_MIP_DROP_MIN"); g_mip_drop_min = m ? atoi(m) : 512;
+    if (g_mip_drop) MLOG("DM_TEX_MIP_DROP=%d: block-compressed 2D textures of %d pixels or more a side are made without their %d largest level(s) (DM_TEX_MIP_DROP_MIN)", g_mip_drop, g_mip_drop_min, g_mip_drop); } return g_mip_drop; }
+static unsigned tex_drop_levels(const tex_t *t) {   // the levels a packaged texture t is made without
+    int n = mip_drop(); if (!n) return 0;
+    if (t->d.target != NVN_TEXTURE_TARGET_2D || !fmt_compressed(t->d.format) || t->d.samples > 1 || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (t->pool && nvn_sparse_pool(t->pool))) return 0;
+    if ((int)t->d.levels < n + 3 || (int)MIN(t->d.width, t->d.height) < g_mip_drop_min) return 0;
+    return (unsigned)n;
+}
+static unsigned tex_drop_of(const tex_t *t, id<MTLTexture> mt) {   // the levels host texture mt of t was made without (0: none, or the levels were cut for another reason)
+    if (!mt || !g_mip_drop || t->d.levels <= mt.mipmapLevelCount) return 0;
+    unsigned n = t->d.levels - (unsigned)mt.mipmapLevelCount;
+    return mt.width == MAX(t->d.width >> n, 1u) && mt.height == MAX(t->d.height >> n, 1u) && n == tex_drop_levels(t) ? n : 0;
+}
+static uint64_t g_stat_drop_skips;
+static int tex_drop_ok(const tex_t *t, id<MTLTexture> mt, const char *what) {   // a guest-level operation on a host texture made without its largest levels: skipped
+    if (!tex_drop_of(t, mt)) return 1;
+    g_stat_drop_skips++; RED_ONCE(162, "%s on a texture made without its largest levels (DM_TEX_MIP_DROP): skipped (first case ser=%llu %ux%u format %#x)", what, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+    return 0;
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
@@ -3156,6 +3181,8 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     d.pixelFormat = (MTLPixelFormat)pf;
     d.width = t->d.width ? t->d.width : 1; d.height = t->d.height ? t->d.height : 1; d.depth = 1; d.arrayLength = 1;
     d.mipmapLevelCount = t->d.levels ? t->d.levels : 1;
+    unsigned drop = packaged ? tex_drop_levels(t) : 0;
+    if (drop) { d.width = MAX(d.width >> drop, 1u); d.height = MAX(d.height >> drop, 1u); d.mipmapLevelCount -= drop; }
     switch (t->d.target) {
         // 1D / 1D array are created as one-row 2D / 2D array textures: translated shaders never declare texture1d (0 in all five games' libraries) and always sample them as 2D; a Metal 1D texture bound to a texture2d argument is a type mismatch with undefined reads.
         // Super Mario 3D World + Bowser's Fury's material shaders sample 64x1 R32F 1D lookup tables heavily every frame (on Maxwell a 2D sample of a 1D texture reads that one row)
@@ -3748,7 +3775,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     d.usage |= keep & (MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView);
     int rb_shift = rb_packed_shift(t->d.format);   // the RGB565 family is repacked into Metal's order on the CPU (rb_packed_shift)
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;   // linear storage no view could take (linear_fit): its rows are copied on the CPU
-    int direct = !linear && !rb_shift && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && nvn_deswz_gpu_direct_supported(&t->d);
+    unsigned drop = tex_drop_levels(t);   // guest levels drop.. are host levels 0.. (DM_TEX_MIP_DROP)
+    int direct = !linear && !rb_shift && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && !drop && nvn_deswz_gpu_direct_supported(&t->d);
     if (direct) d.usage |= MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     id<MTLTexture> mt = reuse && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
                         && (reuse.usage & d.usage) == d.usage
@@ -3771,10 +3799,11 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
     size_t total = 0;
-    for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
+    for (unsigned l = drop; l < d.mipmapLevelCount + drop; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
     }
+    if (drop) { static uint64_t n; if (n++ < 8) MLOG("texture ser=%llu %ux%u format %#x levels %u made without its %u largest level(s): %ux%u, %u levels (DM_TEX_MIP_DROP)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, drop, (unsigned)d.width, (unsigned)d.height, (unsigned)d.mipmapLevelCount); }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
     // A texture in a large pool (BIG_MIN) or one that holds only textures is read through a buffer of its own, held by the upload batch: a one-time read must not leave that memory wired for good
@@ -3807,13 +3836,13 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
         if (upsrc) { uint64_t mo2; id<MTLBuffer> u2 = up_big_src((uint64_t)t->mem, t->L.size, &mo2); if (u2) { upsrc = u2; mb = (__bridge void *)u2; mo = mo2; } }   // up_alloc may have flushed the batch that held the first one
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
-        for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
+        for (unsigned l = drop; enc_ok && l < d.mipmapLevelCount + drop; l++) {
             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
             for (unsigned y = 0; y < layers; y++) {
                 size_t poff; id<MTLBuffer> params = up_param_alloc(&poff);   // Metal 4 has no setBytes: the parameter block of each deswizzle is cut from a shared block (no new GPU buffer each time)
                 if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
-                up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
+                up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l - drop);
                 off += pitch * rows * z;
             }
         }
@@ -3839,7 +3868,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     res_add(stg); [g_up_keep addObject:stg];
     size_t off = 0;
     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
-    for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
+    for (unsigned l = drop; l < d.mipmapLevelCount + drop; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
@@ -3852,7 +3881,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
                 g_zb_tot[l] += (uint32_t)nb; }
-            up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
+            up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l - drop);
             off += pitch * rows * z;
         }
     }
@@ -7071,6 +7100,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
             sg = treg_ep();
         }
         NSUInteger l0 = r.v.set_levels ? r.v.base_level : 0, nl = r.v.set_levels && r.v.nlevels ? r.v.nlevels : base.mipmapLevelCount - l0;
+        { unsigned drop = tex_drop_of(&rp->t, base); if (drop) { l0 = l0 > drop ? l0 - drop : 0; if (r.v.set_levels && r.v.nlevels) nl = nl > drop ? nl - drop : 1; } }   // the host texture starts at the game's level drop (DM_TEX_MIP_DROP)
         if (l0 >= base.mipmapLevelCount) { RED_ONCE(109, "texture view id %d starts at mip %lu beyond %lu levels", tid, (unsigned long)l0, (unsigned long)base.mipmapLevelCount); return nil; }
         // A level count past the texture's levels is cut to those it has, as deko3d's Tegra descriptor writer clips the maximum level (Echoes of Wisdom: levels 1 + 7 of a seven-level texture,
         // which Metal's validation refuses)
@@ -14291,7 +14321,7 @@ static void copy_t2b(const p_copy_b2t *c, uint32_t size) {
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    if (!tex_level_ok(t, level, "texture-to-buffer copy")) return;
+    if (!tex_level_ok(t, level, "texture-to-buffer copy") || !tex_drop_ok(c->tex, t, "texture-to-buffer copy")) return;
     const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;   // S: OP_COPY_STRIDE of an older capture
     size_t row = rs ? (size_t)rs : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = is ? (size_t)is : row * rows;   // per layer: SetCopyImageStride, else tightly packed
@@ -14479,7 +14509,7 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    if (!tex_level_ok(t, level, "buffer-to-texture copy")) return;
+    if (!tex_level_ok(t, level, "buffer-to-texture copy") || !tex_drop_ok(c->tex, t, "buffer-to-texture copy")) return;
     const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;   // S: OP_COPY_STRIDE of an older capture
     size_t row = rs ? (size_t)rs : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = is ? (size_t)is : row * rows;   // per layer: SetCopyImageStride, else tightly packed
@@ -14747,10 +14777,10 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (!s || !c->dst) return;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
-    if (!tex_level_ok(s, sl, "texture copy source")) return;
+    if (!tex_level_ok(s, sl, "texture copy source") || !tex_drop_ok(c->src, s, "texture copy source")) return;
     if (bc_alias_copy(c, s, sl, sz0, dl, dz0)) return;   // the destination aliases a compressed texture: the bytes go there, and the alias's own texture is not made (see bc_alias_copy)
     id<MTLTexture> d = tex_mtl(c->dst); sparse_gpu_wrote(c->dst);
-    if (!d || !tex_level_ok(d, dl, "texture copy destination")) return;
+    if (!d || !tex_level_ok(d, dl, "texture copy destination") || !tex_drop_ok(c->dst, d, "texture copy destination")) return;
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
             enc_b_copy_texture(blit(), s, sz0, sl, MTLOriginMake(0, 0, 0), MTLSizeMake(s.width, s.height, 1), d, dz0, dl, MTLOriginMake(0, 0, 0));
