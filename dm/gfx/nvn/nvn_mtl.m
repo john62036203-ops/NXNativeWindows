@@ -5046,6 +5046,10 @@ static uint64_t g_gptr_sites, g_gptr_filled, g_gptr_draws, g_gptr_short;   // bi
 // (the 300-frame memory report) bumps g_pool_gen, so each pool's next use comes through mtl_addr / mtl_gpu_addr and records the frame; a pool not used for the idle time leaves the set
 // and comes back through pool_res at its next lookup (a commit on the spot). Kept: pools the raw-global-memory pool table lists (addr_meets: the shader reaches them without a lookup)
 // and buffers a live texture object was created over (linear and buffer textures; MTLTexture.buffer)
+static int gmem_ondemand(void); static NSMutableArray *g_gout_q; static uint64_t g_gmem_rgen;
+// With the on-demand pool table (DM_NVN_GMEM_ONDEMAND) a pool a binding addressed is also let go when idle: it keeps its access bit, so a raw access counts as use (gseen) and a pool the
+// shaders still read stays; one neither looked up nor reached for the idle time goes through the table's take-out queue (gmem_scan: cold entry at once, out of the residency set when the
+// submission that may still hold it usable has completed) and comes back through pool_res at its next lookup or through gmem_scan at its next raw access. Pools resident for good (gm 2) stay
 static void pool_unwire(uint64_t frame) { @autoreleasepool {
     static int64_t idle_s = -1; if (idle_s < 0) { const char *e = getenv("DM_NVN_POOL_UNWIRE_S"); idle_s = e ? atoll(e) : 0; if (idle_s > 0) MLOG("memory pools idle for %lld s leave the residency set until their next lookup (DM_NVN_POOL_UNWIRE_S)", (long long)idle_s); }
     if (idle_s <= 0) return;
@@ -5058,16 +5062,26 @@ static void pool_unwire(uint64_t frame) { @autoreleasepool {
     int n = 0, kept_tex = 0, kept_raw = 0; uint64_t bytes = 0;
     pthread_mutex_lock(&g_mu);
     g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); g_pool_sweeps++;   // the per-thread address caches and the vertex tables are invalid: every pool's next use records its frame
+    int ondemand = gmem_ondemand(), queued = 0;
     for (int i = 0; i < g_npool; i++) { pool_ent *p = &g_pools[i];
         if (!p->res || p->used + idle_frames > frame) continue;
+        if (ondemand) {
+            if (p->gm == 2 || (!p->reg && !p->gm) || p->gseen + idle_frames > frame) { kept_raw++; continue; }   // for good; already on its way out; or the shaders reach it
+            if (CFSetContainsValue(pinned, (__bridge const void *)p->buf)) { kept_tex++; continue; }
+            p->reg = 0; p->gm = 0; p->unwired = 1; p->gfence = g_fence + 1; queued++; bytes += p->buf.length;
+            if (!g_gout_q) g_gout_q = [NSMutableArray array];
+            [g_gout_q addObject:@[p->buf, @(p->gfence)]];
+            continue; }
         if (addr_meets(p->lo, p->hi)) { kept_raw++; continue; }
         if (CFSetContainsValue(pinned, (__bridge const void *)p->buf)) { kept_tex++; continue; }
         res_remove(p->buf); p->res = 0; p->unwired = 1; g_pool_res_n--; n++; bytes += p->buf.length; }
+    if (queued) { g_gmem_rgen++; n = queued; }   // the table turns their entries cold at its next build
     pthread_mutex_unlock(&g_mu);
     CFRelease(pinned);
-    if (n) { res_commit(); pthread_mutex_lock(&g_mu); g_pool_unwired += n; g_pool_unwired_mb += bytes >> 20; pthread_mutex_unlock(&g_mu); }
-    MLOG("pool unwire at frame %llu: %d pools (%llu MB) idle for %lld s left the residency set; kept %d the pool table lists and %d under live textures; in all %llu left (%llu MB), %llu came back at a lookup",
-         (unsigned long long)frame, n, (unsigned long long)(bytes >> 20), (long long)idle_s, kept_raw, kept_tex, (unsigned long long)g_pool_unwired, (unsigned long long)g_pool_unwired_mb, (unsigned long long)g_pool_rewired);
+    if (n && !ondemand) { res_commit(); pthread_mutex_lock(&g_mu); g_pool_unwired += n; g_pool_unwired_mb += bytes >> 20; pthread_mutex_unlock(&g_mu); }
+    MLOG("pool unwire at frame %llu: %d pools (%llu MB) idle for %lld s %s; kept %d %s and %d under live textures; in all %llu left (%llu MB), %llu came back at a lookup",
+         (unsigned long long)frame, n, (unsigned long long)(bytes >> 20), (long long)idle_s, ondemand ? "leave the residency set once their last submission completes" : "left the residency set",
+         kept_raw, ondemand ? "resident for good, on their way out or still reached by shaders" : "the pool table lists", kept_tex, (unsigned long long)g_pool_unwired, (unsigned long long)g_pool_unwired_mb, (unsigned long long)g_pool_rewired);
 } }
 static void tex_cold_retire(uint64_t frame); static uint64_t g_gmem_unmapped;
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
@@ -10409,7 +10423,7 @@ static int gmem_scan(void) {
             if ([o[1] unsignedLongLongValue] > done) { [keep addObject:o]; continue; }
             id<MTLBuffer> b = o[0];
             for (int i = 0; i < g_npool; i++) if (g_pools[i].buf == b) { pool_ent *p = &g_pools[i];   // a pool gone since went out through its own deferred release
-                if (p->res && !p->reg && !p->gm && p->gfence <= done) { res_remove(p->buf); p->res = 0; g_pool_res_n--; removed++; g_gm_rm++; }   // reached again, or taken out again later: not yet
+                if (p->res && !p->reg && !p->gm && p->gfence <= done) { res_remove(p->buf); p->res = 0; g_pool_res_n--; removed++; g_gm_rm++; if (p->unwired) { g_pool_unwired++; g_pool_unwired_mb += p->buf.length >> 20; } }   // reached again, or taken out again later: not yet
                 break; }
         }
         g_gout_q = keep;
@@ -10465,7 +10479,7 @@ static id<MTLBuffer> gmem_map(void) {
         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
         int usable = 1; uint32_t state = 0;
         if (ondemand) {
-            usable = p->reg || p->gm; int bit = p->reg || p->gm == 2 ? -1 : gslot_get(g_pidx[k]);   // a bit: not resident, or resident only while reached
+            usable = p->reg || p->gm; int bit = p->gm == 2 ? -1 : gslot_get(g_pidx[k]);   // a bit for every pool not resident for good: the accesses it sees are its use (gseen; pool_unwire)
             if (!usable && bit < 0) { if (!p->res) { if (!gmem_readable(p)) { g_gmem_unmapped++; continue; } [newres addObject:p->buf]; p->res = 1; g_pool_res_n++; } p->gm = 2; usable = 1; nobit++; }   // no bit left to learn whether it is reached: resident for good
             state = bit >= 0 ? (uint32_t)bit + 1 : 0;
         } else if (!p->res) {
