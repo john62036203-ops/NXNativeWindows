@@ -930,14 +930,17 @@ static void pool_res(int i) {
 // stride holding its address and on up to the end of what it asked (rounded up to the stride, plus a stride), made when first asked for. Only what lookups reach is wired. The chunks overlap, as adjacent
 // pools' buffers do at shared pages; GPU addresses are not contiguous across them, so a lookup must say how far it reads. One that does not know (length 1: an indirect draw's index buffer, a raw storage
 // address) gets BIG_UNKNOWN past its address. Raw global memory, whose pool table the shader walks by itself, takes the whole pool: big_full
-enum { BIG_MIN = 512u << 20, BIG_MAX = 32 };
+enum { BIG_MAX = 64 };
 // DM_NVN_BIG_S_MB (16; a power of two, 1..64) and DM_NVN_BIG_UNKNOWN_MB (64): the chunk stride and how far a lookup of unknown length wires. Ocarina of Time keeps a 2.4 GB pool in chunks and
 // holds 1.2 GB of them wired on an 8 GB phone, the largest 305 / 202 / 150 MB (log a46b91a5): smaller chunks wire less around each lookup and let pool_unwire give idle parts back sooner
-static int g_big_shift = -1; static uint64_t g_big_unknown;
-static void big_opts(void) { if (g_big_shift >= 0) return; const char *e = getenv("DM_NVN_BIG_S_MB"); int mb = e ? atoi(e) : 16; if (mb < 1 || mb > 64 || (mb & (mb - 1))) mb = 16;
+// DM_NVN_BIG_MIN_MB (512): the size from which a pool is kept in chunks instead of one buffer. Ocarina of Time's 305 / 202 / 150 MB pools are below 512 and so wired whole (log bdb610c3)
+static int g_big_shift = -1; static uint64_t g_big_unknown, g_big_min;
+#define BIG_MIN g_big_min
+static void big_opts(void) { if (g_big_shift >= 0) return;
+    const char *mn = getenv("DM_NVN_BIG_MIN_MB"); int mmb = mn ? atoi(mn) : 512; if (mmb < 16) mmb = 16; g_big_min = (uint64_t)mmb << 20; const char *e = getenv("DM_NVN_BIG_S_MB"); int mb = e ? atoi(e) : 16; if (mb < 1 || mb > 64 || (mb & (mb - 1))) mb = 16;
     g_big_shift = 20; while ((1 << (g_big_shift - 20)) < mb) g_big_shift++;
     const char *u = getenv("DM_NVN_BIG_UNKNOWN_MB"); int umb = u ? atoi(u) : 64; if (umb < 1 || umb > 1024) umb = 64; g_big_unknown = (uint64_t)umb << 20;
-    if (e || u) MLOG("large memory pools: chunks of %d MB, a lookup of unknown length wires %d MB past its address (DM_NVN_BIG_S_MB, DM_NVN_BIG_UNKNOWN_MB)", 1 << (g_big_shift - 20), umb); }
+    if (e || u || mn) MLOG("large memory pools: from %d MB a pool is in chunks of %d MB, a lookup of unknown length wires %d MB past its address (DM_NVN_BIG_MIN_MB, DM_NVN_BIG_S_MB, DM_NVN_BIG_UNKNOWN_MB)", mmb, 1 << (g_big_shift - 20), umb); }
 #define BIG_S ((uintptr_t)1 << g_big_shift)
 #define BIG_UNKNOWN g_big_unknown
 typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
@@ -949,9 +952,10 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     static int chunks = -1; if (chunks < 0) { const char *e = getenv("DM_NVN_POOL_CHUNKS"); chunks = !e || atoi(e); }
+    big_opts();
     if (size >= BIG_MIN && chunks) {
         pthread_mutex_lock(&g_mu); int k = g_nbig < BIG_MAX ? g_nbig : -1;
-        if (k >= 0) { big_opts(); int *ch = calloc(((b - a) >> g_big_shift) + 1, sizeof *ch); if (!ch) MDIE("pool chunk table"); g_big[g_nbig++] = (big_pool){lo, hi, a, b, mem, ch, 0, [NSMutableArray array]};
+        if (k >= 0) { int *ch = calloc(((b - a) >> g_big_shift) + 1, sizeof *ch); if (!ch) MDIE("pool chunk table"); g_big[g_nbig++] = (big_pool){lo, hi, a, b, mem, ch, 0, [NSMutableArray array]};
             g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); g_pool_adds++; atomic_fetch_add(&g_big_n, 1); }
         pthread_mutex_unlock(&g_mu);
         if (k >= 0) { reg_bump(-1, REG_POOL); static int nl; if (nl++ < 8) MLOG("memory pool %p+%llu MB: in chunks, wired as far as lookups reach", mem, (unsigned long long)(size >> 20)); return; }
