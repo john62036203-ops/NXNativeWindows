@@ -14248,6 +14248,10 @@ static void dispatch(const p_dispatch *dp, const uint8_t *next) {
     NvProg *program = prog_get(S.cprog);
     NvShader *cs = program->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
+    // A profiled frame (DM_NVN_GPUPROF) names its dispatches, the first 64: the encoder lines give a group of dispatches one time and no shader (Ocarina of Time's story movie under Wide
+    // view: 14 dispatches, 60 ms a frame, log 0164f18a)
+    if (g_gp_state == 1) { static uint64_t pf; static int pn; if (pf != g_gp_frame) { pf = g_gp_frame; pn = 0; }
+        if (pn++ < 64) MLOG("[gpuprof] F%llu dispatch %d: %s threadgroups %dx%dx%d%s", (unsigned long long)g_gp_frame, pn, cs->key, (int)dp->x, (int)dp->y, (int)dp->z, dp->ind ? " (indirect)" : ""); }
     int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
     if (ndve == 1) g_ndve_decoded = nil;
     if (ndve == 2 && g_ndve_sub == g_sub_serial && g_ndve_decoded && ndve_direct_draw(cs)) return;
