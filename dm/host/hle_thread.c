@@ -81,6 +81,7 @@ typedef struct thr {
     mach_port_t mport;         // Host thread port (to get CPU time)
     _Atomic int qos_pending;   // SetThreadPriority from another thread changed prio: the thread applies the new class at its next SVC (only a thread can set its own QoS)
     uint32_t qos;
+    int qos_low;               // DM_QOS_LOW names it: utility whatever its priority (qos_low_init)
     // Pausing (SetThreadActivity, used by IL2CPP's garbage collector to stop the world): pause_req = requested, paused = stopped for the current request; when stopped inside an SVC the context comes from the gate frame svc_regs (registered on SVC entry),
     // when stopped in guest code the signal handler saves it into ctx_*; pcv lets the requester wait for "stopped" and the paused thread wait for "resume"
     _Atomic int pause_req; int paused;
@@ -350,7 +351,9 @@ void guest_gate_stack(int own_stack);   // thread.c: the thread's gate slot and 
 // whatever its priority, and the performance controller keeps all of them on fast cores at high clocks. Bands: priority <= e1 (the main thread is 44) user-interactive, <= e2 user-initiated,
 // above that utility; DM_QOS_EDGES=e1,e2 moves them (default 44,59). Read once in svc_thread_main_init, before any other guest thread exists
 static int g_qos_map, g_qos_e1 = 44, g_qos_e2 = 59;
+static void qos_low_init(void);
 static void qos_map_init(void) {
+    qos_low_init();
     const char *e = getenv("DM_QOS_MAP"), *d = getenv("DM_QOS_EDGES"); g_qos_map = e && atoi(e);
     if (d) sscanf(d, "%d,%d", &g_qos_e1, &g_qos_e2);
     if (g_qos_map) LOG("DM_QOS_MAP=1: guest threads get QoS by priority (≤%d interactive, ≤%d user-initiated, the rest utility)", g_qos_e1, g_qos_e2);
@@ -360,8 +363,20 @@ static qos_class_t prio_qos(int prio) {
     if (!g_qos_map) return QOS_CLASS_USER_INTERACTIVE;
     return prio <= g_qos_e1 ? QOS_CLASS_USER_INTERACTIVE : prio <= g_qos_e2 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
 }
+// DM_QOS_LOW=<name>[,<name>...] (off by default): guest threads whose name holds one of these run at utility QoS whatever their priority, so the performance controller can put them
+// on the efficiency cores and leave the fast ones to the frame. Ocarina of Time streams while it plays: ParallelDecompThread and 'ARes Loading 0' take 150-250 ms of CPU a second each at the
+// main thread's priority (47; logs 75a6c666, a46b91a5) and compete with it once the phone lowers its clocks. Donkey Kong Bananza loads up front and holds 30 fps hot. Slower streaming may
+// show as later pop-in at area changes. Read once in svc_thread_main_init
+static char g_qos_low[256];
+static void qos_low_init(void) { const char *e = getenv("DM_QOS_LOW"); if (e && *e) { snprintf(g_qos_low, sizeof g_qos_low, "%s", e); LOG("DM_QOS_LOW: guest threads named %s run at utility QoS", g_qos_low); } }
+static int qos_low_name(const char *name) {
+    if (!g_qos_low[0] || !name || !*name) return 0;
+    char list[256]; snprintf(list, sizeof list, "%s", g_qos_low);
+    for (char *save = NULL, *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) { while (*tok == ' ') tok++; if (*tok && strstr(name, tok)) return 1; }
+    return 0;
+}
 static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and qos are shared with scheduler readers)
-    qos_class_t q = prio_qos(t->prio);
+    qos_class_t q = t->qos_low ? QOS_CLASS_UTILITY : prio_qos(t->prio);
     if ((uint32_t)q != t->qos && !pthread_set_qos_class_self_np(q, 0)) t->qos = (uint32_t)q;
 }
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
@@ -381,7 +396,8 @@ static void *thread_main(void *p) {
     guest_thread_init(); guest_thread_set_id(t->id);
     guest_gate_stack(1);   // the guest runs on its own stack from dm_thread_enter on: this pthread's stack below this frame is where its SVCs run
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); t->entered = 1; g_unlock();
-    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    { char nb[48], hn[64]; const char *nm = thr_name(t, nb, sizeof nb); snprintf(hn, sizeof hn, "%#x %s", t->handle, nm); pthread_setname_np(hn);   // the guest's name (set before StartThread) for sample / Instruments
+      if (qos_low_name(nm)) { pthread_mutex_lock(&G); t->qos_low = 1; qos_apply(t); g_unlock(); static int nl; if (nl++ < 16) LOG("DM_QOS_LOW: thread %#x '%s' runs at utility QoS", t->handle, nm); } }
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
