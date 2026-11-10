@@ -10032,6 +10032,12 @@ static void pool_table_give(id<MTLBuffer> b) {
 // One entry of a pool table, as the walk takes it: the resource ID of what the ID holds (0: nothing of the type, or a texture not made). gone counts IDs without storage, and *dead is set for
 // one whose storage does not exist (yet): one marked gone stays so until it is registered again, which is noted. left / left_req count the textures past limit (what this frame may still
 // make) and those of them a shader read. *transient is set for a view of a retired registration, which goes at the end of this submission. Caller holds g_rmu
+// DM_TEX_LAZY=1 / 2 (off by default), DM_TEX_LAZY_MIN_KB=<KB>: a pool walk makes no host texture for an ID whose texture has none yet (any ID, or with 2 only IDs in CPU_NO_ACCESS pools:
+// render and depth targets) and whose storage is at least that size; the table entry is the dummy until a direct binding makes the texture. From cheemu21's kid-with-sword-remake a4ce449c
+// (the Mighty Green Kokiri Kid line's lazy textures, as its Potato mode runs it: 2, from 4 MB); here for the cold-texture work: what a walk never made needs no retiring
+static int g_tex_lazy = -1; static uint64_t g_stat_lazy_skip, g_tex_lazy_min;
+static int tex_lazy(void) { int v = g_tex_lazy; if (v < 0) { const char *e = getenv("DM_TEX_LAZY"); v = e ? atoi(e) : 0; const char *m = getenv("DM_TEX_LAZY_MIN_KB"); g_tex_lazy_min = m ? (uint64_t)atoll(m) << 10 : 0;
+    if (v) MLOG("DM_TEX_LAZY=%d: pool walks make no host texture for %s of %llu KB or more (DM_TEX_LAZY_MIN_KB)", v, v == 2 ? "IDs in CPU_NO_ACCESS pools" : "any ID", (unsigned long long)(g_tex_lazy_min >> 10)); g_tex_lazy = v; } return v; }
 static uint64_t pool_entry(int samp, int dtt, int id_, uint64_t limit, int *gone, int *left, int *left_req, int *transient, int *dead) {
     if (id_ <= 0) return 0;
     if (samp) return id_ < g_nsreg && g_sreg_ok[id_] && samp_fast(id_) ? g_srid[id_] : 0;
@@ -10040,6 +10046,9 @@ static uint64_t pool_entry(int samp, int dtt, int id_, uint64_t limit, int *gone
     if (r->gone) { ++*gone; return 0; }
     if (!r->view && !tex_storage_live(&r->t)) { ++*gone; *dead = 1; return 0; }
     if (!r->view && pool_unwritten_target(&r->t)) return 0;   // dummy until a pass writes it (its new texture is noted: ser_note)
+    { int lz = tex_lazy(); if (lz && !r->view && r->t.L.size >= g_tex_lazy_min && (lz != 2 || (r->t.pool && (r->t.pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))) && !tex_get(r->t.serial)) {
+        if (!(++g_stat_lazy_skip & (g_stat_lazy_skip - 1)) && g_stat_lazy_skip >= 64) MLOG("DM_TEX_LAZY: %llu pool table entries left without a host texture so far", (unsigned long long)g_stat_lazy_skip);
+        return 0; } }
     if (!r->view && pool_tex_size(&r->t) > limit && !pkg_shared(&r->t) && !tex_get(r->t.serial) && !(pool_seen(id_) && g_walk_req < POOL_REQ_BYTES)) { ++*left; *left_req += pool_seen(id_); return 0; }   // a texture a shader read is made whatever the budget, so it reads the dummy for a few frames at most
     if (r->tt1 && r->tt1 - 1 != dtt) return 0;   // an ID of another texture type, seen before (the table holds only its own type): nothing to look up or charge (the idea is from PR 1428)
     if (!r->view && !pkg_shared(&r->t)) { g_walk_spent += pool_tex_size(&r->t); if (pool_seen(id_)) g_walk_req += pool_tex_size(&r->t); }
