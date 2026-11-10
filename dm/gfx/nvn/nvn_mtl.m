@@ -15357,7 +15357,7 @@ static void clear_ds_tri(const p_clear_ds *c) {
 typedef struct { const void *a, *b; const char *an, *bn; uint32_t n; } sp_ent;
 enum { SP_N = 1024 };
 static sp_ent g_sp[SP_N]; static _Atomic uint32_t g_sp_port; static int g_sp_on = -1;
-static int sp_cmp(const void *x, const void *y) { uint32_t a = ((const sp_ent *)x)->n, b = ((const sp_ent *)y)->n; return a < b ? 1 : a > b ? -1 : 0; }
+static int subprof_cmp(const void *x, const void *y) { uint32_t a = ((const sp_ent *)x)->n, b = ((const sp_ent *)y)->n; return a < b ? 1 : a > b ? -1 : 0; }
 static void *sp_main(void *arg) { (void)arg;
     pthread_setname_np("dm subprof"); uint64_t total = 0, miss = 0, t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     for (;;) {
@@ -15374,7 +15374,7 @@ static void *sp_main(void *arg) { (void)arg;
         miss += !put;
         uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         if (now - t0 < 20000000000ull) continue;
-        qsort(g_sp, SP_N, sizeof *g_sp, sp_cmp);
+        qsort(g_sp, SP_N, sizeof *g_sp, subprof_cmp);
         MLOG("[subprof] %llu samples of the submit thread in 20 s (%llu not counted); leaf < caller:", (unsigned long long)total, (unsigned long long)miss);
         for (int i = 0; i < 40 && g_sp[i].n; i++) MLOG("[subprof] %5.1f%% %s < %s", 100.0 * g_sp[i].n / (double)(total ? total : 1), g_sp[i].an ? g_sp[i].an : "?", g_sp[i].bn ? g_sp[i].bn : "?");
         memset(g_sp, 0, sizeof g_sp); total = miss = 0; t0 = now;
