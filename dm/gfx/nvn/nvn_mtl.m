@@ -1040,9 +1040,12 @@ static int big_new(big_pool *b, uintptr_t lo, uintptr_t hi, uintptr_t end, uint6
     return g_npool - 1;
 }
 // The entry of a large pool for [addr, addr + len): the chunk of its stride, made or lengthened to reach as far as asked; -1 past the pool's end
+static int gmem_ondemand(void);
 static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (addr + len > b->hi) return -1;
-    if (b->full) return b->full - 1;
+    // The whole-pool entry the raw pool table makes (big_full) is only for the table: lookups keep taking chunks. Handing them the whole pool once it existed made every binding in a
+    // chunked pool wire all of it (Ocarina of Time's 305 / 202 / 150 MB pools stayed whole in chunk mode, log fd4429a9). The table gates that entry on its own (gmem_scan)
+    if (b->full && !gmem_ondemand()) return b->full - 1;
     uintptr_t k = (addr - b->a) >> g_big_shift, lo = b->a + (k << g_big_shift);
     uint64_t want = len > 1 ? len : BIG_UNKNOWN; uintptr_t end = (addr + want + BIG_S - 1) & ~(uintptr_t)(BIG_S - 1); end += BIG_S; if (end > b->b || end < lo) end = b->b;
     int i = b->chunk[k] - 1;
