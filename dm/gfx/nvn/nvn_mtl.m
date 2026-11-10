@@ -15351,7 +15351,43 @@ static void clear_ds_tri(const p_clear_ds *c) {
        (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height);
 }
 
+// DM_NVN_SUBPROF=1 (diagnostic): a sampling profile of the thread that runs mtl_exec, the submit thread. A helper thread reads its program counter and link register 500 times a second
+// (thread_get_state, no suspend), names both with dladdr and counts the pairs; every 20 s the 40 most frequent are logged as "[subprof] <percent> <leaf> < <caller>" and the counts start
+// again. For finding where the per-draw CPU time goes (Ocarina of Time's Hyrule Field: 2,330 draws, 71,000 instructions a draw, 30 ms of CPU a frame; log 51acc9da)
+typedef struct { const void *a, *b; const char *an, *bn; uint32_t n; } sp_ent;
+enum { SP_N = 1024 };
+static sp_ent g_sp[SP_N]; static _Atomic uint32_t g_sp_port; static int g_sp_on = -1;
+static int sp_cmp(const void *x, const void *y) { uint32_t a = ((const sp_ent *)x)->n, b = ((const sp_ent *)y)->n; return a < b ? 1 : a > b ? -1 : 0; }
+static void *sp_main(void *arg) { (void)arg;
+    pthread_setname_np("dm subprof"); uint64_t total = 0, miss = 0, t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    for (;;) {
+        usleep(2000);
+        thread_act_t th = atomic_load(&g_sp_port); if (!th) continue;
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) continue;
+        Dl_info da = {0}, db = {0}; dladdr((void *)arm_thread_state64_get_pc(st), &da); dladdr((void *)arm_thread_state64_get_lr(st), &db);
+        const void *ka = da.dli_saddr, *kb = db.dli_saddr; total++;
+        uint32_t h = (uint32_t)(((uintptr_t)ka >> 2) * 2654435761u ^ ((uintptr_t)kb >> 2) * 40503u) % SP_N; int put = 0;
+        for (int i = 0; i < 16; i++) { sp_ent *e = &g_sp[(h + i) % SP_N];
+            if (!e->n) { *e = (sp_ent){ka, kb, da.dli_sname, db.dli_sname, 1}; put = 1; break; }
+            if (e->a == ka && e->b == kb) { e->n++; put = 1; break; } }
+        miss += !put;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        if (now - t0 < 20000000000ull) continue;
+        qsort(g_sp, SP_N, sizeof *g_sp, sp_cmp);
+        MLOG("[subprof] %llu samples of the submit thread in 20 s (%llu not counted); leaf < caller:", (unsigned long long)total, (unsigned long long)miss);
+        for (int i = 0; i < 40 && g_sp[i].n; i++) MLOG("[subprof] %5.1f%% %s < %s", 100.0 * g_sp[i].n / (double)(total ? total : 1), g_sp[i].an ? g_sp[i].an : "?", g_sp[i].bn ? g_sp[i].bn : "?");
+        memset(g_sp, 0, sizeof g_sp); total = miss = 0; t0 = now;
+    }
+    return NULL;
+}
+static void sp_note(void) {
+    if (g_sp_on < 0) { const char *e = getenv("DM_NVN_SUBPROF"); g_sp_on = e && atoi(e) != 0;
+        if (g_sp_on) { pthread_t t; pthread_create(&t, NULL, sp_main, NULL); pthread_detach(t); MLOG("DM_NVN_SUBPROF: the submit thread is sampled 500 times a second, the top pairs logged every 20 s"); } }
+    if (g_sp_on) { uint32_t me = pthread_mach_thread_np(pthread_self()); if (atomic_load_explicit(&g_sp_port, memory_order_relaxed) != me) atomic_store(&g_sp_port, me); }
+}
 void mtl_exec(const uint8_t *p) {
+    sp_note();
     if (!g_state_inited) state_reset();
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
