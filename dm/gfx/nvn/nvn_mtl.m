@@ -367,7 +367,7 @@ static id<MTLHeap> rh_take(MTLTextureDescriptor *d, int *reused) {
 }
 // A shared render target in a GPU-only pool (tex_mtl_), in recycled memory: written by the GPU alone, so its bytes never come from the CPU's view of the pool
 static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
-    if (!sw_on(rh_mode()) || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || !(t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)
+    if (!sw_on(rh_mode()) || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || !(d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))   // upstream 707cac957: with or without COMPRESSIBLE
         || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))
         || d.storageMode != MTLStorageModePrivate || d.textureType == MTLTextureTypeTextureBuffer) return nil;
     int reused = 0; id<MTLHeap> heap = rh_take(d, &reused);
@@ -5039,7 +5039,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         int filled = 0;
         if (!mt) mt = pool_heap_texture(t, d);
         if (!mt) rt_lossy(d);   // DM_NVN_RT_LOSSY
-        if (!mt) { mt = rc_take(d, t); if (!mt) mt = [g_dev newTextureWithDescriptor:d];   // rc_take: DM_NVN_RT_RECLAIM's free list (upstream PR #1588)
+        // rh_texture (X26): a GPU-only target the pool's placement heap did not take (pool_heap_texture: a virtual or large pool, a window boundary, no room) is placed in recycled memory
+        // as upstream places all of them. This tree had the recycler but no call of it: in Ocarina of Time's castle town 594 such textures (1.2 GB) were made per 300 frames
+        if (!mt) { mt = rc_take(d, t); if (!mt) mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];   // rc_take: DM_NVN_RT_RECLAIM's free list (upstream PR #1588)
             if (!mt && d.compressionType == MTLTextureCompressionTypeLossy) { d.compressionType = MTLTextureCompressionTypeLossless; mt = [g_dev newTextureWithDescriptor:d]; }   // refused lossy (rt_lossy)
             if (mt) { res_add(mt); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
