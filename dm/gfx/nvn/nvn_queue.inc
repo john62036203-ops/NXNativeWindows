@@ -111,7 +111,7 @@ static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
     { void dm_submit_rt_self(const char *who); dm_submit_rt_self("queue replay"); }
-    uint64_t frame=UINT64_MAX, spin_t0=0;
+    uint64_t frame=UINT64_MAX, spin_t0=0, busy_acc=0, busy_mean=0, busy_frames=0, busy_spin_frames=0;
     for(;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;
         for(;;) {
@@ -148,8 +148,12 @@ static void *nq_worker(void *unused) {
                 // spent 59% of its time in waits of well under a millisecond between a frame's 30-odd submissions and ran at a mean 1.5 GHz: a thread that sleeps that often looks idle to the
                 // performance controller. A test of whether one that stays runnable is kept on a fast core
                 static int64_t spin_ns=-1; if(spin_ns<0) { const char *e=getenv("DM_NVN_SUBMIT_SPIN_US"); spin_ns=e?atoll(e)*1000:0; if(spin_ns<0) spin_ns=0; if(spin_ns) LOG("[nvn] queue replay thread polls up to %lld us before it sleeps (DM_NVN_SUBMIT_SPIN_US)",(long long)(spin_ns/1000)); }
-                uint64_t tnow=spin_ns?now_ns():0; if(spin_ns && !spin_t0) spin_t0=tnow;
-                if(spin_ns && tnow-spin_t0<(uint64_t)spin_ns) { pthread_mutex_unlock(&nq_mu); for(int i=0;i<64;i++) __asm__ volatile("yield"); pthread_mutex_lock(&nq_mu); }
+                // Only in heavy frames (X24): the poll also ran in menus and light scenes, where it cost 1.1-2.0 W for nothing and brought the phone to thermal state 1 sooner, at which
+                // the clock halves. The budget applies while the replay work of recent frames (a running mean over presents) is at least DM_NVN_SUBMIT_SPIN_MIN_MS (default 6)
+                static int64_t spin_min=-1; if(spin_min<0) { const char *e=getenv("DM_NVN_SUBMIT_SPIN_MIN_MS"); spin_min=e?atoll(e)*1000000:6000000; if(spin_min<0) spin_min=0; }
+                int spin_on=spin_ns && busy_mean>=(uint64_t)spin_min;
+                uint64_t tnow=spin_on?now_ns():0; if(spin_on && !spin_t0) spin_t0=tnow;
+                if(spin_on && tnow-spin_t0<(uint64_t)spin_ns) { pthread_mutex_unlock(&nq_mu); for(int i=0;i<64;i++) __asm__ volatile("yield"); pthread_mutex_lock(&nq_mu); }
                 else pthread_cond_wait(&nq_cv,&nq_mu);
             }
         }
@@ -162,6 +166,7 @@ static void *nq_worker(void *unused) {
         pthread_mutex_unlock(&nq_mu);
         uint64_t fence=0, present=0;
         if(n->kind==NQ_COMMANDS || n->kind==NQ_PRESENT) {
+            uint64_t busy_t0=now_ns();
             dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush();
             dm_host_work++; mtl_prepare(); dm_host_work--;
             gfx_enter(); nq_cost cost=nq_cost_begin();
@@ -177,6 +182,13 @@ static void *nq_worker(void *unused) {
                 present=mtl_present(&n->texture,n->period,n->crop); mtl_tex_unpin(n->texture.serial);
             }
             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+            busy_acc+=now_ns()-busy_t0;
+            if(n->kind==NQ_PRESENT) {
+                busy_mean=(busy_mean*3+busy_acc)/4; busy_acc=0; busy_frames++;
+                if(getenv("DM_NVN_SUBMIT_SPIN_US")) { static int64_t mn=-1; if(mn<0) { const char *e=getenv("DM_NVN_SUBMIT_SPIN_MIN_MS"); mn=e?atoll(e)*1000000:6000000; if(mn<0) mn=0; }
+                    if(busy_mean>=(uint64_t)mn) busy_spin_frames++;
+                    if(busy_frames%600==0) { LOG("[nvn] queue replay poll: on in %llu of the last 600 frames (replay work mean %.1f ms, threshold %.1f ms)",(unsigned long long)busy_spin_frames,busy_mean/1e6,mn/1e6); busy_spin_frames=0; } }
+            }
         }
         pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
     }
