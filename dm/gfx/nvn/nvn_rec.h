@@ -184,6 +184,7 @@ static void *rec_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-encode");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     { void dm_frame_wg_join(void); dm_frame_wg_join(); }   // hle_nvn.c: the encode thread works to the frame's deadline
+    { void dm_submit_rt_self(const char *who); dm_submit_rt_self("encode"); }
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
         while (!g_rb_head) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }

@@ -110,6 +110,7 @@ static void nq_cost_end(nq_cost c) {
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+    { void dm_submit_rt_self(const char *who); dm_submit_rt_self("queue replay"); }
     uint64_t frame=UINT64_MAX;
     for(;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;

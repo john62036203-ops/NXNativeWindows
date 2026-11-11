@@ -1821,6 +1821,18 @@ static void slow_emit(uint64_t f) {
 // DM_RT_COMP=<ms> fixes the declaration; default auto = every 120 frames take the larger of 1.25 × the p90 and 1.1 × the peak of this thread's per-frame CPU time and re-declare if it differs from the declared value by > 15% (capped at 0.9 × period).
 // DM_RT=0 leaves the acquire thread on the standard policy (its QoS only), for power A/B: the real-time declaration is how the performance controller learns the frame deadline, and it may hold the clock up for it
 static int rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[nvn] DM_RT=0: the present thread gets no time-constraint policy (QoS only)"); } return v; }
+// DM_NVN_SUBMIT_RT=<ms> (this fork, off by default): the thread that replays the queue into Metal and the encode thread declare a time-constraint policy of their own (period and
+// constraint 33.3 ms, computation <ms>; 1 = 16 ms). On an iPhone 16 Pro Max in Hyrule Field the replay thread ran at a mean 1.5-1.6 GHz at thermal state 0-1 (17 ms of CPU a frame
+// for 2,300 draws, 59% of its time in short waits), with the GPU at 25 ms and the frame at 40: a test of whether the scheduler keeps a declared thread on the fast cores
+void dm_submit_rt_self(const char *who) {
+    const char *e = getenv("DM_NVN_SUBMIT_RT"); int ms = e ? atoi(e) : 0; if (ms <= 0) return; if (ms == 1) ms = 16; if (ms > 30) ms = 30;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb); uint64_t period_ns = 33333333ull, comp_ns = (uint64_t)ms * 1000000ull;
+    thread_time_constraint_policy_data_t p = {
+        .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
+        .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
+    kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    LOG("[nvn] %s thread time-constraint policy (period 33.333 ms, computation %d ms) %s (DM_NVN_SUBMIT_RT)", who, ms, kr == KERN_SUCCESS ? "set" : "failed to set");
+}
 static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
     if (!rt_on()) return;
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
