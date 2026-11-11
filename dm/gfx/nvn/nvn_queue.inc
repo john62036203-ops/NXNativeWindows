@@ -111,7 +111,7 @@ static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
     { void dm_submit_rt_self(const char *who); dm_submit_rt_self("queue replay"); }
-    uint64_t frame=UINT64_MAX, spin_t0=0;
+    uint64_t frame=UINT64_MAX, spin_t0=0; unsigned spin_hits=0; int spin_slept=0;
     for(;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;
         for(;;) {
@@ -140,20 +140,25 @@ static void *nq_worker(void *unused) {
                 break;
             }
             if(q) break;
-            // NVN events can also be changed by plain stores through mapped pool memory.
-            // A bounded notification poll only while such a word is awaited complements API/callback wakes.
-            if(mapped_event_wait) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
-            else {
-                // DM_NVN_SUBMIT_SPIN_US=<µs> (this fork, off by default): with nothing to replay the thread polls for that long before it sleeps. In Hyrule Field on an iPhone 16 Pro Max it
-                // spent 59% of its time in waits of well under a millisecond between a frame's 30-odd submissions and ran at a mean 1.5 GHz: a thread that sleeps that often looks idle to the
-                // performance controller. A test of whether one that stays runnable is kept on a fast core
+            {
+                // DM_NVN_SUBMIT_SPIN_US=<µs> (this fork, off by default): with nothing to replay the thread polls for up to that long before it sleeps, on both waits below. On an iPhone
+                // 16 Pro Max in Hyrule Field at night (30-odd submissions a frame, the thread asleep 59-64% of the time in waits of well under a millisecond) the first form, which polled
+                // only before the plain wait, gave frame time p50 34-51 ms against 45-63 without and a third fewer dropped frames; its clock did not change (1.6-1.9 GHz), so what it saves
+                // is the wake after each sleep. It also polled 3 ms a frame with nothing to draw (CPU 0.7 -> 2.2 W in the menus), so the full length is given only after four waits in a
+                // row that work ended (a frame of many submissions); after a wait that slept, the next ones poll an eighth of it
                 static int64_t spin_ns=-1; if(spin_ns<0) { const char *e=getenv("DM_NVN_SUBMIT_SPIN_US"); spin_ns=e?atoll(e)*1000:0; if(spin_ns<0) spin_ns=0; if(spin_ns) LOG("[nvn] queue replay thread polls up to %lld us before it sleeps (DM_NVN_SUBMIT_SPIN_US)",(long long)(spin_ns/1000)); }
                 uint64_t tnow=spin_ns?now_ns():0; if(spin_ns && !spin_t0) spin_t0=tnow;
-                if(spin_ns && tnow-spin_t0<(uint64_t)spin_ns) { pthread_mutex_unlock(&nq_mu); for(int i=0;i<64;i++) __asm__ volatile("yield"); pthread_mutex_lock(&nq_mu); }
-                else pthread_cond_wait(&nq_cv,&nq_mu);
+                uint64_t budget=spin_hits>=4?(uint64_t)spin_ns:(uint64_t)spin_ns/8;
+                if(spin_ns && tnow-spin_t0<budget) { pthread_mutex_unlock(&nq_mu); for(int i=0;i<64;i++) __asm__ volatile("yield"); pthread_mutex_lock(&nq_mu); }
+                else { spin_slept=1;
+                    // NVN events can also be changed by plain stores through mapped pool memory.
+                    // A bounded notification poll only while such a word is awaited complements API/callback wakes.
+                    if(mapped_event_wait) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
+                    else pthread_cond_wait(&nq_cv,&nq_mu); }
             }
         }
-        spin_t0=0;
+        if(spin_slept) spin_hits=0; else if(spin_t0 && spin_hits<4) spin_hits++;
+        spin_t0=0; spin_slept=0;
         j->first=n->next; if(!j->first) j->last=NULL;
         // Round-robin ready queues: a continually fed independent producer cannot starve another queue.
         if(q->next) { nq_queue **link=&nq_queues; while(*link!=q) link=&(*link)->next; *link=q->next; nq_queue *tail=nq_queues; while(tail->next) tail=tail->next; tail->next=q; q->next=NULL; }
