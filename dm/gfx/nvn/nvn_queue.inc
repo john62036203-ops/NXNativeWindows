@@ -40,6 +40,9 @@ typedef struct nq_queue {
 } nq_queue;
 static pthread_mutex_t nq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t nq_cv = PTHREAD_COND_INITIALIZER;
+// Every change the replay thread waits for is announced through nq_wake, which also counts it: a polling replay thread (DM_NVN_SUBMIT_SPIN_US) watches the count with nq_mu released
+static _Atomic uint64_t nq_gen;
+static void nq_wake(void) { atomic_fetch_add_explicit(&nq_gen,1,memory_order_release); pthread_cond_broadcast(&nq_cv); }
 static pthread_once_t nq_once = PTHREAD_ONCE_INIT;
 static nq_queue *nq_queues;
 static int nq_test_held;   // nvn_queue_test_hold: replay takes no queued work while set (unit tests only)
@@ -66,7 +69,7 @@ static nq_queue *nq_get(queue_t *q) {
     if(!p) { p=calloc(1,sizeof *p); if(!p) die("queue state allocation failed"); p->serial=q->serial; p->origin=q->origin_ll; p->next=nq_queues; nq_queues=p; }
     return p;
 }
-static void nq_publish(nq_receipt *r,uint64_t fence) { r->fence=fence; r->published=1; pthread_cond_broadcast(&nq_cv); }
+static void nq_publish(nq_receipt *r,uint64_t fence) { r->fence=fence; r->published=1; nq_wake(); }
 static int nq_predicate(uint32_t current,unsigned mode,uint32_t target) { return mode==0 ? current==target : (uint32_t)(current-target)<0x80000000u; }
 static int nq_sync_encoded(const sync_t *s,uint64_t *fence) {
     if(s->fenced==3) { nq_receipt *r=(nq_receipt *)(uintptr_t)s->fence; if(!r->published) return 0; *fence=r->fence; return 1; }
@@ -75,7 +78,7 @@ static int nq_sync_encoded(const sync_t *s,uint64_t *fence) {
 void nvn_queue_gpu_progress(void) {
     pthread_mutex_lock(&nq_mu); uint64_t done=mtl_completed_fence(); nq_event_write **p=&nq_event_writes;
     while(*p) { nq_event_write *w=*p; if(w->fence<=done) { *p=w->next; free(w); } else p=&w->next; }
-    pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+    nq_wake(); pthread_mutex_unlock(&nq_mu);
 }
 static void nq_event_publish(volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t gpu_fence) {
     pthread_mutex_lock(&nq_mu);
@@ -87,7 +90,7 @@ static void nq_event_publish(volatile uint32_t *word,unsigned mode,uint32_t valu
         nq_node *n=q->first->first;
         if(n->kind==NQ_EVENT && n->waiting && n->event==word && (gpu_fence ? gpu_fence>=n->event_predecessor : nq_event_pending(word)<=mtl_completed_fence()) && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),n->mode,n->value)) { n->event=NULL; n->wait_fence=gpu_fence; }
     }
-    pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+    nq_wake(); pthread_mutex_unlock(&nq_mu);
 }
 void nvn_event_publish(volatile uint32_t *word,unsigned mode,uint32_t value) { nq_event_publish(word,mode,value,0); }
 void nvn_event_publish_gpu(volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t fence) { nq_event_publish(word,mode,value,fence); }
@@ -149,7 +152,16 @@ static void *nq_worker(void *unused) {
                 static int64_t spin_ns=-1; if(spin_ns<0) { const char *e=getenv("DM_NVN_SUBMIT_SPIN_US"); spin_ns=e?atoll(e)*1000:0; if(spin_ns<0) spin_ns=0; if(spin_ns) LOG("[nvn] queue replay thread polls up to %lld us before it sleeps (DM_NVN_SUBMIT_SPIN_US)",(long long)(spin_ns/1000)); }
                 uint64_t tnow=spin_ns?now_ns():0; if(spin_ns && !spin_t0) spin_t0=tnow;
                 uint64_t budget=spin_hits>=4?(uint64_t)spin_ns:(uint64_t)spin_ns/8;
-                if(spin_ns && tnow-spin_t0<budget) { pthread_mutex_unlock(&nq_mu); for(int i=0;i<64;i++) __asm__ volatile("yield"); pthread_mutex_lock(&nq_mu); }
+                if(spin_ns && tnow-spin_t0<budget) {
+                    // The poll does not take nq_mu: the first form took it again every few hundred nanoseconds to scan, and with both waits polling (X20 on the phone) the threads that
+                    // enqueue and the completion handlers that publish fences could not get it: frames of 90-100 ms, the GPU "busy" 79 ms, this thread at 3.2-3.6 GHz with nothing to do.
+                    // It watches nq_gen, which every announced change raises, and looks at the queues again only then; a wait on an event word the game stores into mapped memory, which
+                    // nothing announces, looks again every 100 us
+                    uint64_t g0=atomic_load_explicit(&nq_gen,memory_order_acquire), t_end=spin_t0+budget, t_look=tnow+100000; pthread_mutex_unlock(&nq_mu);
+                    for(;;) { for(int i=0;i<64;i++) __asm__ volatile("yield");
+                        if(atomic_load_explicit(&nq_gen,memory_order_acquire)!=g0) break;
+                        uint64_t t=now_ns(); if(t>=t_end || (mapped_event_wait && t>=t_look)) break; }
+                    pthread_mutex_lock(&nq_mu); }
                 else { spin_slept=1;
                     // NVN events can also be changed by plain stores through mapped pool memory.
                     // A bounded notification poll only while such a word is awaited complements API/callback wakes.
@@ -183,7 +195,7 @@ static void *nq_worker(void *unused) {
             }
             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
         }
-        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); nq_wake(); pthread_mutex_unlock(&nq_mu);
     }
     return NULL;
 }
@@ -211,7 +223,7 @@ static void nq_flatten(nq_job *j,const uint8_t *p,unsigned depth) {
         p+=h.size;
     }
 }
-static void nq_enqueue(nq_queue *q,nq_job *j) { if(q->last) q->last->next=j; else q->first=j; q->last=j; nq_put(q->tail); q->tail=j->receipt; q->tail->refs++; pthread_cond_broadcast(&nq_cv); }
+static void nq_enqueue(nq_queue *q,nq_job *j) { if(q->last) q->last->next=j; else q->first=j; q->last=j; nq_put(q->tail); q->tail=j->receipt; q->tail->refs++; nq_wake(); }
 void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
     j->objects.klen=16; j->frame=dm_nvn_frame_count();
@@ -238,7 +250,7 @@ uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int cro
     pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket=(uintptr_t)j->receipt;
     nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu); return ticket;
 }
-void nvn_queue_test_hold(int on) { pthread_mutex_lock(&nq_mu); nq_test_held=on; pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu); }
+void nvn_queue_test_hold(int on) { pthread_mutex_lock(&nq_mu); nq_test_held=on; nq_wake(); pthread_mutex_unlock(&nq_mu); }
 void nvn_queue_present_release(uint64_t ticket) {
     if(!ticket) return; pthread_mutex_lock(&nq_mu); nq_put((nq_receipt *)(uintptr_t)ticket); pthread_mutex_unlock(&nq_mu);
 }
