@@ -28,6 +28,10 @@
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
+// DM_MEM_MAP_LIMIT=0 / 1 (this fork) overrides the profile's mem_map_limit for a run. With DM_ALIAS_SIZE=0x200000000 it is HookLink's answer to Ocarina of Time's white screen after the
+// Master Sword on an iPhone (dsi-hub 0840c94d: the 4 GB alias region ran out of addresses at +3.75 GB; with 8 GB and no limit the game went on, mapped up to +6.00 GB), taken as
+// switches instead of profile values so that a phone that cannot reserve the larger region is put back by its env file
+static int mem_map_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MEM_MAP_LIMIT"); v = e && *e ? atoi(e) != 0 : DM_GAME_MEM_MAP_LIMIT; if (e && *e) LOG("[mem] MapPhysicalMemory limit %s (DM_MEM_MAP_LIMIT)", v ? "on" : "off"); } return v; }
 static size_t g_reserve;           // its size: RESERVE less the profile's alias region plus the one in use (mem_init_once)
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 static size_t g_heap_seen;        // the largest heap opened so far: with the guest in files, SetHeapSize zeroes a heap that grows back below it
@@ -839,7 +843,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         uint64_t charged = (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + atomic_load(&g_alias_mapped);
-        if (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged)) {
+        if (mem_map_limit() && (charged > APP_POOL || size > APP_POOL - charged)) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
@@ -986,7 +990,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
         // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
-        if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
+        if (mem_map_limit() && num == 0x2C) {
             int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
             if (need && need > room) {
                 pthread_mutex_unlock(&g_map_lock);
@@ -1057,7 +1061,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_UsedMem:  case I_UsedNonSys:  pthread_mutex_lock(&g_map_lock);
                                              v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
                                              // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
-                                             if (DM_GAME_MEM_MAP_LIMIT) v += (uint64_t)atomic_load(&g_alias_mapped);
+                                             if (mem_map_limit()) v += (uint64_t)atomic_load(&g_alias_mapped);
                                              pthread_mutex_unlock(&g_map_lock); break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)
