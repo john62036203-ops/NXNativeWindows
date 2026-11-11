@@ -36,5 +36,7 @@ DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffe
 DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
+DM_SHADOW_DROP	choice	0=全部,1=少一層（最遠的影子關閉）,2=少兩層,9=全關	0	gfxapi:nvn	Performance	影子	減少後遠處沒有影子，每格少畫幾百個物件。
+DM_GRASS_DIV	choice	1=全部,2=一半,4=四分之一,0=全關	1	gfxapi:nvn	Performance	草	實驗性：減少後可能是某些區塊的草消失，而不是平均變稀。
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD

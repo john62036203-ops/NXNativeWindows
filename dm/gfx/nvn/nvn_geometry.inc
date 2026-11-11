@@ -555,7 +555,7 @@ static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
 // Metal holds a mesh grid to DMSH_MESH_GRID threadgroups, so it launches the draw's workgroups in blocks of that many, one object threadgroup a block. Native mesh draws have no
 // equivalent fallback: the demanded pipeline must finish compiling before its first draw, so each one built at a draw is recorded as an M row (pso_user.tsv) and the prewarm builds
 // the rows before the game reaches them (docs/reference/shaders.md, Native mesh pipelines compiled at their first draw)
-static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind, ind_rec; } g_mtk;   // ind: an indirect draw's threadgroups (mdx_mask), ind_rec: its {count, first} record
+static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind, ind_rec; uint32_t div; } g_mtk;   // ind: an indirect draw's threadgroups (mdx_mask), ind_rec: its {count, first} record
 static void draw_(const p_draw *dw, const p_draw_idx *di);
 static uint64_t g_mtk_n, g_mtk_wait;
 static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)};   // only the submit thread uses it: prewarm workers build pipelines (mtk_build) and the submit thread claims them (warm_claim)
@@ -661,7 +661,7 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     g_args_dirty[4] = 1; encode_args(en, ms, 4, 1);
     // A task shader's threadgroups are the draw's workgroups; with no task, the object function's are blocks of DMSH_MESH_GRID of them (mdx_mask writes their count at +16)
     MTLSize to = MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1), tm = MTLSizeMake(ms->mesh_threads, 1, 1);
-    if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind + (ts ? 0 : 16) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
+    if (g_mtk.ind) [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind + (ts && !g_mtk.div ? 0 : 16) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
     else [en drawMeshThreadgroups:MTLSizeMake(ts ? g_mtk.count : (g_mtk.count + DMSH_MESH_GRID - 1) / DMSH_MESH_GRID, 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
 }
 // DrawMeshTasksIndirect: {count, first}, which the game's culling writes earlier in the submission, while Metal's indirect mesh draw takes {x, y, z}. mdx_run copies the count to a {count, 1, 1} on the
@@ -670,6 +670,7 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // 73 % of the submit thread in Ocarina of Time's Kokiri Forest, frames of 90 ms and more against 25 ms of GPU work
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
+    int gdiv = grass_div(); if (!gdiv) return;   // the launcher's Grass setting (DM_GRASS_DIV, nvn_mtl.m)
     // Diagnostic DM_NVN_SKIP_MESH=1 (off by default): drops every task / mesh draw, as DM_NVN_SKIP_FS drops draws by fragment shader, to measure what they cost in all (the picture is wrong)
     { static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = e && atoi(e); if (skip) MLOG("DM_NVN_SKIP_MESH: task / mesh draws dropped (diagnostic; the picture is wrong)"); } if (skip) return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -684,11 +685,13 @@ static void mesh_tasks_draw(const p_draw *dw) {
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
     uint64_t ind = 0, ind_rec = 0;
     if (dw->ind) { void *mb; uint64_t mo;
-        if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
+        uint32_t dv = ts && gdiv > 1 ? (uint32_t)gdiv : 0; uint64_t mkey = dw->ind + (dv ? 4 : 0);   // a thinned task draw has its own copy (mdx_run)
+        if (!mdx_find(dw->ind, mkey, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, mkey, &ind)) ind = 0; }
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_rec)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
     }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
-    g_mtk.ind = ind; g_mtk.ind_rec = ind_rec;
+    g_mtk.ind = ind; g_mtk.ind_rec = ind_rec; g_mtk.div = ind && ts && gdiv > 1 ? (uint32_t)gdiv : 0;
+    if (!ind && ts && gdiv > 1) g_mtk.count = (g_mtk.count + (uint32_t)gdiv - 1) / (uint32_t)gdiv;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
     draw_(&triangle, NULL);

@@ -1780,6 +1780,11 @@ static int bw_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_bw_n; i++) i
 static int br_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_br_n; i++) if (lo < g_br_hi[i] && g_br_lo[i] < hi) return 1; return 0; }
 // buffer → buffer / fill: reads [rlo, rhi) (0, 0 when nothing is read), writes [wlo, whi)
 static uint64_t g_wr_epoch;   // Bumped by every buffer write outside a render pass (copy / update / fill, texture → buffer, dispatch): indirect-draw conversions made before it are stale (ixc_run)
+// DM_GRASS_DIV=<n> (this fork; the launcher's Grass setting): a task shader's indirect mesh draw runs ceil(count / n) of its workgroups, 0 drops task / mesh draws. mdx_run takes such a
+// draw a second time under the key (record, record + 4) with n as its divisor, and mdx_mask's object-block count at +16 of that copy is then that number (mdx.metal is in the shader
+// image and stays as it is)
+static int grass_div(void) { static int d = -1; if (d < 0) { const char *e = getenv("DM_GRASS_DIV"); d = e ? atoi(e) : 1; if (d < 0 || d > 64) d = 1;
+    if (d != 1) MLOG("grass (DM_GRASS_DIV=%d): %s", d, d ? "task / mesh draws run one workgroup in that many" : "task / mesh draws dropped"); } return d; }
 static uint64_t g_mdx_epoch;  // Bumped by GPU writes that can change an indirect-count multi-draw's records or count (copy, fill, texture → buffer, dispatch; see mdx_run)
 // Writes since the last drain. A drain (mdi_wait: commit, then wait for the GPU) completes every GPU write encoded so far, so until the submission ends a CPU read of guest memory is
 // stale only when a GPU write encoded after the drain overlaps it. The submission-wide sets (pend, sbw) cannot tell before from after, so each later write is also kept here: storage
@@ -13359,7 +13364,8 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     uint64_t lo = ~0ull, hi = 0;   // the hull of the records and counts taken, for the uniform update check
     #define MDX_TAKE(IND, CNT, I, W) do { mdx_ent *e_ = mdx_slot((IND), (CNT)); if (e_->tag != g_mdx_tag && nq < QMAX) { *e_ = (mdx_ent){(IND), (CNT), 0, g_mdx_tag}; g_mdx_n++; \
         q[nq].e = e_; q[nq].i = (uint32_t)(I); q[nq++].words = (W); lo = MIN(lo, MIN((IND), (CNT))); hi = MAX(hi, MAX((IND) + 4 * (W), (CNT) + 4)); } } while (0)
-    if (dw && dw->prim == DM_PRIM_MESH_TASKS) MDX_TAKE(dw->ind, dw->ind, DMSH_MESH_GRID, 0); else if (dw) MDX_TAKE(dw->ind, dw->mdi_cnt, dw->mdi_i, 4); else MDX_TAKE(di->ind, di->mdi_cnt, di->mdi_i, 5);   // words 0: an indirect mesh draw, keyed by its record alone (i: the mesh grid's limit, mdx.metal)
+    int gdv = grass_div();
+    if (dw && dw->prim == DM_PRIM_MESH_TASKS) { MDX_TAKE(dw->ind, dw->ind, DMSH_MESH_GRID, 0); if (gdv > 1) MDX_TAKE(dw->ind, dw->ind + 4, gdv, 0); } else if (dw) MDX_TAKE(dw->ind, dw->mdi_cnt, dw->mdi_i, 4); else MDX_TAKE(di->ind, di->mdi_cnt, di->mdi_i, 5);   // words 0: an indirect mesh draw, keyed by its record alone (i: the mesh grid's limit, mdx.metal)
     if (g_mdx_range) {
         const p_multi_draw *m = g_mdx_range;
         for (int i = (dw ? dw->mdi_i : di->mdi_i) + 1; i < m->max && nq < QMAX; i++) {
@@ -13375,7 +13381,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
                 int hit = 0; for (int k = 0; d < hi && lo < d + n && k < nq && !hit; k++) { const mdx_ent *e = q[k].e; hit = (d < e->ind + 4 * q[k].words && e->ind < d + n) || (d < e->cnt + 4 && e->cnt < d + n); }
                 if (hit) { g_mdx_stop = p; break; } continue; }
             p_draw dt; p_draw_idx it; const p_draw *d = h.op == OP_DRAW ? draw_rec(a, h.size, &dt) : NULL; const p_draw_idx *x = h.op == OP_DRAW_IDX ? draw_idx_rec(a, h.size, &it) : NULL;
-            if (d && d->prim == DM_PRIM_MESH_TASKS && d->ind) MDX_TAKE(d->ind, d->ind, DMSH_MESH_GRID, 0);
+            if (d && d->prim == DM_PRIM_MESH_TASKS && d->ind) { MDX_TAKE(d->ind, d->ind, DMSH_MESH_GRID, 0); if (gdv > 1) MDX_TAKE(d->ind, d->ind + 4, gdv, 0); }
             else if (d && mdx_wanted(d, NULL)) MDX_TAKE(d->ind, d->mdi_cnt, d->mdi_i, 4);
             else if (x && mdx_wanted(NULL, x)) MDX_TAKE(x->ind, x->mdi_cnt, x->mdi_i, 5);
         }
@@ -13773,6 +13779,21 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL: dropping draws whose target width is ≤ %d (diagnostic; the picture is wrong)", small); }
       if (small > 0 && R.has_rt && !g_defer_replaying) { int k = R.rt.n && R.rt.color[0] ? 0 : R.rt.depth ? 8 : -1;
         if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
+    // DM_SHADOW_DROP=<n> (this fork; the launcher's Shadows setting): draws into the last n shadow maps of a frame are dropped (9: all). A shadow map here is a square depth-only
+    // target of 512 or more; Ocarina of Time draws 3-4 of 1000x1000 per frame, nearest first (6 / 35 / 195 draws in Hyrule Field), 500-670 of a frame's 1400-2700 draws. Their clears
+    // still land, so the dropped ranges are unshadowed. The number per frame is the previous frame's
+    { static int drop = -1; if (drop < 0) { const char *e = getenv("DM_SHADOW_DROP"); drop = e ? atoi(e) : 0; if (drop < 0) drop = 0; if (drop) MLOG("shadows (DM_SHADOW_DROP=%d): draws into the last %d shadow maps of a frame are dropped", drop, drop); }
+      if (drop > 0 && R.has_rt && !g_defer_replaying && !(R.rt.n && R.rt.color[0]) && R.rt.depth) {
+        uint64_t s_; int lv, sl; rt_sub(&R.rt, 8, &s_, &lv, &sl); const tex_t *t = R.rt.depth; uint32_t w = MAX(t->d.width >> lv, 1u), h = MAX(t->d.height >> lv, 1u);
+        if (w == h && w >= 512) {
+            static uint64_t fr = ~0ull, last, dropped, kept, frames; static int idx = -1, total;
+            uint64_t f = atomic_load(&g_cur_frame), key = s_ * 64 + (uint64_t)sl * 8 + (uint64_t)lv + 1;
+            if (f != fr) { if (idx >= 0) total = idx + 1; fr = f; idx = -1; last = 0;
+                if (++frames % 600 == 0) { MLOG("shadows: %d shadow maps per frame; in the last 600 frames with them %llu draws dropped, %llu kept (DM_SHADOW_DROP=%d)", total, (unsigned long long)dropped, (unsigned long long)kept, drop); dropped = kept = 0; } }
+            if (key != last) { idx++; last = key; }
+            if (total > 0 && idx >= total - drop) { dropped++; return; }
+            kept++;
+        } } }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); return; }
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
@@ -16320,8 +16341,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // A texture made on first resolution joins the residency set (res_add), which a submission commits; a window texture presented before any submission has used it was still
     // outside the committed set when the display command buffer sampled it. Super Smash Bros. Ultimate presents its window texture in its first frames before drawing into it:
     // the display queue page-faulted (kIOGPUCommandBufferCallbackErrorPageFault) and macOS then ignored every later command buffer of the process, so the window stayed pink
-    // (headless runs never present, and every game before drew into a window texture before presenting it). A commit with nothing new costs nothing
-    res_commit();
+    // (headless runs never present, and every game before drew into a window texture before presenting it). A commit with nothing new costs nothing.
+    // Not for the host's own present snapshots (serials 2^61 + n, in their own residency set, committed when made): the commit takes g_res_mu, which the submitting thread holds while
+    // it commits a frame's work, and on the display link thread that wait was a hitch on screen (kid-with-sword-remake X11: four callbacks of 59-138 ms on an iPhone)
+    if ((t->serial >> 61) != 1) res_commit();
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // A separate command buffer is queued after this frame's rendering (the same queue executes in submit order); does not wait for the GPU and does not disturb frame pacing
     static int rl = -1; static float rr[4]; static FILE *rlf; static pthread_mutex_t rlmu = PTHREAD_MUTEX_INITIALIZER;
