@@ -13788,13 +13788,17 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
       if (drop > 0 && R.has_rt && !g_defer_replaying && !(R.rt.n && R.rt.color[0]) && R.rt.depth) {
         uint64_t s_; int lv, sl; rt_sub(&R.rt, 8, &s_, &lv, &sl); const tex_t *t = R.rt.depth; uint32_t w = MAX(t->d.width >> lv, 1u), h = MAX(t->d.height >> lv, 1u);
         if (w == h && w >= 512) {
-            static uint64_t fr = ~0ull, last, dropped, kept, frames; static int idx = -1, total;
+            // The cascades are the targets of the size of the frame's first one: Hyrule Field also has a 1600x1600 and a 536x536 square depth target after its three of 1000x1000
+            // (X25 counted those two as shadow maps and dropped the wrong one)
+            static uint64_t fr = ~0ull, last, dropped, kept, frames; static int idx = -1, total; static uint32_t cw;
             uint64_t f = atomic_load(&g_cur_frame), key = s_ * 64 + (uint64_t)sl * 8 + (uint64_t)lv + 1;
-            if (f != fr) { if (idx >= 0) total = idx + 1; fr = f; idx = -1; last = 0;
-                if (++frames % 600 == 0) { MLOG("shadows: %d shadow maps per frame; in the last 600 frames with them %llu draws dropped, %llu kept (DM_SHADOW_DROP=%d)", total, (unsigned long long)dropped, (unsigned long long)kept, drop); dropped = kept = 0; } }
-            if (key != last) { idx++; last = key; }
-            if (total > 0 && idx >= total - drop) { dropped++; return; }
-            kept++;
+            if (f != fr) { if (idx >= 0) total = idx + 1; fr = f; idx = -1; last = 0; cw = w;
+                if (++frames % 600 == 0) { MLOG("shadows: %d shadow maps of %ux%u per frame; in the last 600 frames with them %llu draws dropped, %llu kept (DM_SHADOW_DROP=%d)", total, cw, cw, (unsigned long long)dropped, (unsigned long long)kept, drop); dropped = kept = 0; } }
+            if (w == cw) {
+                if (key != last) { idx++; last = key; }
+                if (total > 0 && idx >= total - drop) { dropped++; return; }
+                kept++;
+            }
         } } }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); return; }
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
