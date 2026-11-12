@@ -5643,14 +5643,68 @@ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compress
 // its terrain tiles (260x260 RG8, 9 levels, in a CPU-cached pool) after a flush over their storage made them CPU-written. Its resource defragmentation (main+0x5bc988) later moves each
 // tile with memcpy and re-creates the texture at the new address, which uploaded the zeros the storage held: a tile's grass got no length and its ground no light (dark, bare meadows a
 // few seconds after loading)
-static struct { tex_t t; void *tex; unsigned level, slice, n; int att; } g_rtm[8]; static int g_nrtm;   // n: the layers the pass draws from slice on; att: the colour slot
+static struct { tex_t t; void *tex; unsigned level, slice, n; int att, own; } g_rtm[8]; static int g_nrtm;   // n: the layers the pass draws from slice on; att: the colour slot; own: a GPU texture's (gsb_store)
 static int tex_storage_dst(const tex_t *t);
 static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, unsigned layer0, const NVNcopyRegion *r, const char *from, int absorb);
+// (upstream 6c3aeb37, PR #2077; render passes and clears here, copies not) A GPU texture in storage the CPU can read: on the hardware a render pass or a texture clear into it writes
+// that storage, and the game may read it there. Ocarina of Time's terrain defragmentation moves the normal maps the GPU drew (260x260 RG8, 9 levels, a CPU_CACHED | GPU_CACHED pool,
+// never flushed, so GPU textures here) with memcpy and re-creates them at the new address, where the host found the zeros the storage had kept: stripes or flat ground after dungeon
+// entries and exits. So the GPU writes the storage too: after each such write, in the same command buffer, the region is copied from the host texture into the frame arena and
+// swizzled from there into the pool's buffer (the swz kernel, dm/gfx/msl/deswz.metal). DM_NVN_GPU_STORAGE=0 turns the stores off
+static int mtl_fmt_depth(MTLPixelFormat f); static size_t mtl_pf_block_bytes(MTLPixelFormat pf);
+static id<MTL4ComputeCommandEncoder> dispatch_enc(int game); static int rb_copy_shift(const tex_t *t, id<MTLTexture> mt);
+static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_t drow, size_t dimg, size_t wb, size_t rows, size_t nz, int shift);
+static uint64_t g_gsb_stores, g_gsb_bytes;
+void mtl_gsb_stats(uint64_t *n, uint64_t *bytes) { *n = g_gsb_stores; *bytes = g_gsb_bytes; }
+static int tex_storage_gpu(const tex_t *t, id<MTLTexture> mt) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GPU_STORAGE"); on = !e || atoi(e) != 0; if (!on) MLOG("DM_NVN_GPU_STORAGE=0: what the GPU writes into a GPU texture is not written into its storage"); }
+    if (!on || !mt || !tex_unc(t) || !tex_storage_ok(t, 1) || tex_cpu_written(t->serial) || tex_storage_dst(t)) return 0;
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    return bpb && !(16 % bpb) && mt.sampleCount == 1 && !mtl_fmt_depth(mt.pixelFormat) && mt.pixelFormat != MTLPixelFormatStencil8 && mtl_pf_block_bytes(mt.pixelFormat) == (size_t)bpb;
+}
+static void gsb_store(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned slice, unsigned n, const NVNcopyRegion *r) {
+    static id<MTLComputePipelineState> ps; static int failed;
+    if (!n || failed || !tex_storage_gpu(t, mt) || level >= mt.mipmapLevelCount) return;
+    if (slice + n > mt.arrayLength * (mt.textureType == MTLTextureTypeCube || mt.textureType == MTLTextureTypeCubeArray ? 6 : 1)) return;
+    uint32_t row, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(&t->d, level, slice, &row, &rows, &slices, &base, &th, &td, &bpb) || slices != 1 || td) return;
+    int32_t lw = (int32_t)(row / bpb), lh = (int32_t)rows, x0 = 0, y0 = 0, x1 = lw, y1 = lh;
+    if (r) { x0 = MAX(r->xoffset, 0); y0 = MAX(r->yoffset, 0); x1 = MIN(r->xoffset + r->width, lw); y1 = MIN(r->yoffset + r->height, lh); }
+    if (x1 <= x0 || y1 <= y0) return;
+    if (!ps) {
+        NSError *e = nil; id<MTLLibrary> lib = host_lib("deswz", &e); id<MTLFunction> fn = [lib newFunctionWithName:@"swz"];
+        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        if (!ps) { failed = 1; MLOG("[RED] cannot create the GPU swizzle into texture storage: %s (what the GPU draws into GPU textures stays out of their storage)", e.localizedDescription.UTF8String); return; }
+    }
+    void *pb; uint64_t po, pg;
+    if (!mtl_gpu_addr((uint64_t)(uintptr_t)t->mem, t->L.size, &pb, &po, &pg)) return;
+    uint32_t xb0 = (uint32_t)x0 * bpb, xb1 = (uint32_t)x1 * bpb, pad = xb0 & 15u, h = (uint32_t)(y1 - y0);
+    size_t pitch = ((size_t)(xb1 - (xb0 & ~15u)) + 15) & ~(size_t)15, img = pitch * h;
+    id<MTLBuffer> ab; size_t ao = arena_alloc(img * n, &ab);
+    id<MTL4ComputeCommandEncoder> e = blit();
+    for (unsigned z = 0; z < n; z++)
+        enc_b_copy_texture_buffer(e, mt, slice + z, level, MTLOriginMake((NSUInteger)x0, (NSUInteger)y0, 0), MTLSizeMake((NSUInteger)(x1 - x0), h, 1), ab, ao + z * img + pad, pitch, img);
+    int shift = rb_copy_shift(t, mt);
+    if (shift && !rb_swap_gpu(ab.gpuAddress + ao + pad, pitch, img, ab.gpuAddress + ao + pad, pitch, img, (size_t)(xb1 - xb0), h, n, shift)) return;
+    nvn_texlayout L; nvn_tex_layout(&t->d, &L);
+    id<MTLBuffer> qb; size_t qo = arena_alloc(96, &qb);
+    struct { uint64_t src_off, dst_off, base, pitch, img, layer_stride; uint32_t x0, x1, y0, rows, th, gobs_x, gob2; } *q = (void *)((uint8_t *)qb.contents + qo);
+    *q = (typeof(*q)){0, 0, base, pitch, img, L.layer_size, xb0, xb1, (uint32_t)y0, h, th, MAX(nvn_tex_level_gobs(&t->d, level), (row + 63u) >> 6), (uint32_t)nvn_gob_switch2};
+    g_wr_epoch++; g_mdx_epoch++; sbw_note((uint64_t)(uintptr_t)t->mem, t->L.size, SBW_GPU);
+    e = dispatch_enc(0); enc_c_pso(e, ps);
+    enc_c_args(e, ab.gpuAddress + ao, 0); enc_c_args(e, pg, 1); enc_c_args(e, qb.gpuAddress + qo, 2);
+    enc_c_dispatch(e, MTLSizeMake((pitch / 16 + 31) / 32, h, n), MTLSizeMake(32, 1, 1));
+    g_gsb_bytes += img * n;
+    if (g_gsb_stores++ < 4) MLOG("GPU texture in storage the CPU can read ser=%llu %ux%u format %#x level %u: what the GPU wrote is written into its storage on the GPU (%dx%d at %d,%d, %u layers)",
+                                 (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, level, x1 - x0, y1 - y0, x0, y0, n);
+}
 static void rt_mirror_add(const tex_t *t, id<MTLTexture> mt, NSUInteger level, NSUInteger slice, int att) {
-    if (!mt || t->d.target == NVN_TEXTURE_TARGET_3D || !tex_storage_dst(t)) return;
+    if (!mt || t->d.target == NVN_TEXTURE_TARGET_3D) return;
+    int own = !tex_storage_dst(t);
+    if (own && !tex_storage_gpu(t, mt)) return;
     for (int i = 0; i < g_nrtm; i++) if (g_rtm[i].t.serial == t->serial && g_rtm[i].level == level && g_rtm[i].slice == slice) return;
     if (g_nrtm == (int)(sizeof g_rtm / sizeof g_rtm[0])) { RED_ONCE(131, "more than %d storage-backed render targets in one pass: the rest are not read back into their storage", g_nrtm); return; }
-    g_rtm[g_nrtm++] = (typeof(g_rtm[0])){*t, (void *)CFBridgingRetain(mt), (unsigned)level, (unsigned)slice, 1, att};
+    g_rtm[g_nrtm++] = (typeof(g_rtm[0])){*t, (void *)CFBridgingRetain(mt), (unsigned)level, (unsigned)slice, 1, att, own};
 }
 // Once the pass's layers are known: a layered or slice-merged pass (renderTargetArrayLength) draws into that many layers of each attachment from its attached slice on, all read back
 static void rt_mirror_layers(MTL4RenderPassDescriptor *pd) {
@@ -5664,7 +5718,8 @@ static void rt_mirror_flush(void) {
     for (int i = 0; i < n; i++) {
         id<MTLTexture> mt = CFBridgingRelease(g_rtm[i].tex);
         NVNcopyRegion r = {0, 0, 0, (int)MAX(mt.width >> g_rtm[i].level, 1u), (int)MAX(mt.height >> g_rtm[i].level, 1u), (int)g_rtm[i].n};
-        mirror_readback(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, &r, "render", 1);
+        if (g_rtm[i].own) gsb_store(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, g_rtm[i].n, NULL);
+        else mirror_readback(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, &r, "render", 1);
     }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
 }
@@ -15048,7 +15103,11 @@ static void clear_tex(const p_clear_tex *c) {
     int depth = pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float_Stencil8, stencil = pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatDepth32Float_Stencil8;
     if (c->r.xoffset || c->r.yoffset || (NSUInteger)c->r.width != w || (NSUInteger)c->r.height != h || (c->mask & mtl_pf_chmask(pf)) != mtl_pf_chmask(pf)
         || !(t.usage & MTLTextureUsageRenderTarget)) {
-        if (!depth && !stencil && (t.usage & MTLTextureUsageRenderTarget)) { clear_tex_tri(t, lv, l0, c); return; }
+        if (!depth && !stencil && (t.usage & MTLTextureUsageRenderTarget)) {
+            clear_tex_tri(t, lv, l0, c);
+            if (!is3d) gsb_store(c->tex, t.parentTexture ? t.parentTexture : t, lv, l0 + (unsigned)c->r.zoffset, (unsigned)nz, &c->r);   // (6c3aeb37) the clear writes a GPU texture's storage too
+            return;
+        }
         RED_ONCE(44, "texture clear case not implemented: region %d,%d %dx%d (level size %lux%lu) mask %#x render-target capable %d (format %#x flags %#x)", c->r.xoffset, c->r.yoffset, c->r.width, c->r.height,
                  (unsigned long)w, (unsigned long)h, c->mask, !!(t.usage & MTLTextureUsageRenderTarget), c->tex->d.format, c->tex->d.flags);
         return;
@@ -15066,6 +15125,7 @@ static void clear_tex(const p_clear_tex *c) {
         else rp.colorAttachments[0].clearColor = c->is_uint ? MTLClearColorMake(c->c.u[0], c->c.u[1], c->c.u[2], c->c.u[3]) : MTLClearColorMake(c->c.f[0], c->c.f[1], c->c.f[2], c->c.f[3]);
         ser_gate(); enc_r_end(enc_r_begin(rp));
     }
+    if (!depth && !stencil && !is3d) gsb_store(c->tex, t.parentTexture ? t.parentTexture : t, lv, l0 + (unsigned)c->r.zoffset, (unsigned)nz, &c->r);   // (6c3aeb37)
 }
 
 // Context description of one submit (mtl_sub_commit takes one per submit and prints it into the failure line when the command buffer errors): for the GPU memory fault on the first frame entering Travincal, the failure line had only the sequence number and error code, and it was impossible to tell what was in that submit
