@@ -173,7 +173,8 @@ def info_plist(bundle_id, name, version, category, show_fps, lang, sdk_ver, sdk_
         'MinimumOSVersion': tc.setting('ios_deployment', tc.IOS_DEPLOYMENT), 'LSRequiresIPhoneOS': True, 'UIDeviceFamily': [1, 2], 'UIRequiredDeviceCapabilities': ['arm64'],
         # dm/ios/project.yml info.properties
         'UILaunchStoryboardName': '', 'UIFileSharingEnabled': True, 'LSSupportsOpeningDocumentsInPlace': True,
-        'UISupportedInterfaceOrientations': ['UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft'],
+        # this fork: portrait too on the iPhone (front_ios.m / DmLayout.h already lay the picture above the controls when the view is taller than wide)
+        'UISupportedInterfaceOrientations': ['UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationPortrait'],
         'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationLandscapeRight', 'UIInterfaceOrientationLandscapeLeft'],
         'UIRequiresFullScreen': True, 'UIStatusBarHidden': True, 'UIViewControllerBasedStatusBarAppearance': False, 'LSApplicationCategoryType': category,
         'DMCommit': 'win ' + time.strftime('%Y-%m-%d %H:%M'),   # which build this is: the host prints it at start (dm/host/main.c), so a crash log shows the packed build
