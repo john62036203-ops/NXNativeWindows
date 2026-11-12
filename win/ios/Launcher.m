@@ -8,6 +8,10 @@
 // A variable an env file set (DM_ENV_FILE_KEYS, main.m) is shown but kept. A row marked "disabled" (settings.tsv always/<condition>: listed for every game, but this one has
 // nothing it acts on) is shown greyed out and never applied. Only a choice that differs from the game's default is kept, in NSUserDefaults under "launcher.<ENV>", as the Swift launcher does.
 #import <UIKit/UIKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+// Cloud saves (this fork; the Swift launcher's CloudSavesSection): the iCloud Drive folder the player picks, kept as a bookmark (dm/ios/Sources/CloudSaves.m). front_ios.m puts it into
+// DM_SAVE_SYNC at Play (dm_cloud_saves_env), and the host brings the save in from there at the first save mount and sends it there after each save (dm/host/save_sync.h)
+NSString *dm_cloud_saves_path(BOOL *stale); BOOL dm_store_cloud_saves(NSURL *url); void dm_clear_cloud_saves(void);
 #include <math.h>
 #include <os/proc.h>
 #include <stdio.h>
@@ -212,8 +216,8 @@ static int increased_memory_limit(void) {
 }
 
 // ---- the settings list ----
-@interface DmSettingsVC : UITableViewController
-@property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory;
+@interface DmSettingsVC : UITableViewController <UIDocumentPickerDelegate>
+@property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory; @property (copy) NSString *cloudNote;
 @end
 @implementation DmSettingsVC
 - (void)viewDidLoad {
@@ -225,12 +229,19 @@ static int increased_memory_limit(void) {
 }
 - (void)dealloc { [self.timer invalidate]; }
 - (NSInteger)resetSection { return self.m.sections.count; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return self.m.sections.count + 2; }   // the sections, Reset, Memory available
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? (NSInteger)[self.m inSection:self.m.sections[sec]].count : sec > self.resetSection ? 2 : 1; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? self.m.sections[sec] : nil; }
+- (NSInteger)cloudSection { return self.resetSection + 1; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return self.m.sections.count + 3; }   // the sections, Reset, Cloud saves, Memory available
+- (NSString *)cloudFolder { BOOL stale = NO; NSString *f = dm_cloud_saves_path(&stale);
+    if (!f.length && stale && !self.cloudNote) self.cloudNote = @"The folder chosen before can no longer be read (the app was signed differently). Please choose it again.";
+    return f.length ? f : nil; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
+    if (sec == self.cloudSection) return self.cloudFolder ? 3 : 2;
+    return sec < (NSInteger)self.m.sections.count ? (NSInteger)[self.m inSection:self.m.sections[sec]].count : sec > self.cloudSection ? 2 : 1; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? self.m.sections[sec] : sec == self.cloudSection ? @"Cloud saves" : nil; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)sec {
     if (sec == self.resetSection) return @"Brings back all settings this game was tested with.";
-    if (sec > self.resetSection && !increased_memory_limit())
+    if (sec == self.cloudSection) return self.cloudNote ?: @"Choose the same folder on each device: in iCloud Drive, or in another cloud app that shows in Files. Only the game save is copied (a few MB). It comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.";
+    if (sec > self.cloudSection && !increased_memory_limit())
         return @"Increased Memory Limit is off: iOS gives this app less memory, and a big game can be closed when an area loads. A free Apple ID cannot turn it on (the signing app drops it); a paid developer account can. Texture memory saver (Performance) helps meanwhile.";
     return nil;
 }
@@ -244,6 +255,32 @@ static int increased_memory_limit(void) {
         __weak DmSettingsVC *w = self;
         UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [w.m reset]; [w.tableView reloadData]; }]];
         b.enabled = self.m.changed; b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading; b.translatesAutoresizingMaskIntoConstraints = NO; [v addSubview:b];
+        [NSLayoutConstraint activateConstraints:@[[b.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [b.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [b.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
+        return c;
+    }
+    if (ip.section == self.cloudSection) {   // Cloud saves: the folder, Choose, Turn off
+        __weak DmSettingsVC *w = self; NSString *folder = self.cloudFolder;
+        if (ip.row == 0) {
+            UILabel *l = body_label(@"Cloud saves"); UILabel *st = value_label(folder ? folder.lastPathComponent : @"Off");
+            st.lineBreakMode = NSLineBreakByTruncatingMiddle; [st setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+            [v addSubview:l]; [v addSubview:st];
+            [NSLayoutConstraint activateConstraints:@[[l.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [l.centerYAnchor constraintEqualToAnchor:v.centerYAnchor],
+                [st.leadingAnchor constraintGreaterThanOrEqualToAnchor:l.trailingAnchor constant:12], [st.trailingAnchor constraintEqualToAnchor:g.trailingAnchor], [st.centerYAnchor constraintEqualToAnchor:v.centerYAnchor],
+                [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
+            return c;
+        }
+        UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration]; cfg.contentInsets = NSDirectionalEdgeInsetsZero;
+        UIButton *b;
+        if (ip.row == 1) {
+            cfg.title = folder ? @"Choose a different folder…" : @"Choose a folder…";
+            b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [w pickCloudFolder]; }]];
+        } else {
+            cfg.title = @"Turn off cloud saves"; cfg.baseForegroundColor = UIColor.systemRedColor;
+            b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
+                dm_clear_cloud_saves(); fprintf(stderr, "launcher: cloud saves turned off\n"); w.cloudNote = nil; [w.tableView reloadData]; }]];
+        }
+        b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading; b.translatesAutoresizingMaskIntoConstraints = NO; [v addSubview:b];
         [NSLayoutConstraint activateConstraints:@[[b.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [b.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
             [b.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
         return c;
@@ -328,6 +365,22 @@ static int increased_memory_limit(void) {
     }
     return [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsSingleSelection children:items];
 }
+- (void)pickCloudFolder {   // .open, not a copy: the folder stays where it is and the bookmark keeps pointing at it
+    UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
+    pk.delegate = self; pk.allowsMultipleSelection = NO; pk.modalPresentationStyle = UIModalPresentationFormSheet;
+    UIViewController *top = self.parentViewController ?: self; while (top.presentedViewController) top = top.presentedViewController;
+    fprintf(stderr, "launcher: choosing the cloud-save folder\n");
+    [top presentViewController:pk animated:YES completion:nil];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)pk didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *url = urls.firstObject; if (!url) return;
+    BOOL scoped = [url startAccessingSecurityScopedResource];   // a bookmark of a picked folder is made inside its scope
+    BOOL ok = dm_store_cloud_saves(url);
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    self.cloudNote = ok ? @"Saved. The game uses this folder when you press Play." : @"That folder could not be remembered. Try a different one.";
+    [self.tableView reloadData];
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)pk { fprintf(stderr, "launcher: cloud-save folder picker cancelled\n"); }
 - (void)refreshReset { [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:0 inSection:self.resetSection]] withRowAnimation:UITableViewRowAnimationNone]; }
 
 - (void)slid:(UISlider *)sl {
