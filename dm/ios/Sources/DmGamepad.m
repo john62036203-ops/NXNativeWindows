@@ -137,7 +137,7 @@ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};
 static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap, 3 = Native (DM_GAME_PAD_LAYOUT's numbers)
 static NSString *const k_native_key = @"DmPadNativeOffered";   // a profile that starts in Native switches to it once, over a layout saved before Native existed
 // Native layout (in points of an 874 x 402 landscape screen, scaled by gu; x from the corner rectangle's edges, y from its top or bottom): centre, radius
-static const int k_nat[] = {B_Y, B_A, B_B, B_ZR, B_ZL, B_X, B_R, B_PLUS, B_MINUS};
+static const int k_nat[] = {B_Y, B_A, B_B, B_ZR, B_ZL, B_X, B_R, B_L, B_PLUS, B_MINUS};   // X35 (this fork): L added, left of R
 static const NSTimeInterval K_ZL_TAP = 0.3;
 // Native D-pad (A7): above the stick at the left, its arms' outer edge N_DPAD_R from the centre; a touch within N_DPAD_GRAB of it takes the D-pad, and one landing in the band
 // out to N_DPAD_MOAT goes to neither (no stick starts right beside the D-pad). The stick's ring at home keeps clear of it
@@ -565,6 +565,7 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
         case B_ZL: x = R - 128 * g; y = Bt - 202 * g; rr = 28; break;
         case B_X: x = R - 46 * g; y = Bt - 188 * g; rr = 28; break;
         case B_R: x = R - 44 * g; y = Bt - 264 * g; rr = 24; break;
+        case B_L: x = R - 118 * g; y = Bt - 270 * g; rr = 24; break;   // X35: left of R, clear of ZL below it
         case B_B: x = R - 30 * g; y = Bt - 36 * g; rr = 22; break;
         case B_PLUS: x = R - 150 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // A7: beside the menu and −, off the hearts at the top left
         default: x = R - 36 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
@@ -902,7 +903,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
         CGPathCloseSubpath(tp); glassPart(arm, tp, 0, 0.95, 0); CGPathRelease(tp);
         [_nat addSublayer:arm]; _nbase[b] = arm;
     }
-    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
+    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_L] = @"L", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
         CGFloat s = r * 0.52;   // the icon's half size: the letter chip keeps the lower right corner
@@ -911,13 +912,14 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
             case B_B: iconBack(d, s); break;
             case B_ZR: iconBow(d, s); break;
             case B_R: iconWheel(d, s); break;
+            case B_L: glassSymbol(d, @"l.square", s * 1.5, scale); break;
             case B_ZL: iconFairy(d, s); break;
             case B_A: iconAction(d, s); break;
             case B_X: iconBoot(d, s); break;
             case B_PLUS: iconChest(d, s); break;
             default: iconMap(d, s); break;   // −
         }
-        glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);
+        glassChip(d, chip[b], b == B_R || b == B_L || b == B_ZL || b == B_ZR, scale);
         [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base;
         if (b == B_ZL) {   // the lock badge: a small disc with a padlock at the key's upper right
             CGFloat br = 10 * g; CAShapeLayer *mb = nil; CALayer *m = glassDiscFill(br, &mb, [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.9]);
