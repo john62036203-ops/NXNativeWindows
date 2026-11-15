@@ -5657,8 +5657,12 @@ static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_
 static uint64_t g_gsb_stores, g_gsb_bytes;
 void mtl_gsb_stats(uint64_t *n, uint64_t *bytes) { *n = g_gsb_stores; *bytes = g_gsb_bytes; }
 static int tex_storage_gpu(const tex_t *t, id<MTLTexture> mt) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GPU_STORAGE"); on = !e || atoi(e) != 0; if (!on) MLOG("DM_NVN_GPU_STORAGE=0: what the GPU writes into a GPU texture is not written into its storage"); }
+    // X36 (this fork): by default only RG8 (NVN format 0xd), the terrain normal tiles 6c3aeb37 is for; with every format (DM_NVN_GPU_STORAGE=all) the Temple of Time's
+    // Master Sword scene drew all white on an iPhone 16 Pro Max (X34), and was right again with DM_NVN_GPU_STORAGE=0
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GPU_STORAGE"); on = !e ? 1 : !strcmp(e, "all") ? 2 : atoi(e) != 0;
+        MLOG("%s", !on ? "DM_NVN_GPU_STORAGE=0: what the GPU writes into a GPU texture is not written into its storage" : on == 2 ? "DM_NVN_GPU_STORAGE=all: GPU texture storage writes for every format" : "GPU texture storage writes for RG8 textures only (the terrain tiles; DM_NVN_GPU_STORAGE=all for every format)"); }
     if (!on || !mt || !tex_unc(t) || !tex_storage_ok(t, 1) || tex_cpu_written(t->serial) || tex_storage_dst(t)) return 0;
+    if (on == 1 && t->d.format != 0xd) return 0;
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     return bpb && !(16 % bpb) && mt.sampleCount == 1 && !mtl_fmt_depth(mt.pixelFormat) && mt.pixelFormat != MTLPixelFormatStencil8 && mtl_pf_block_bytes(mt.pixelFormat) == (size_t)bpb;
 }
