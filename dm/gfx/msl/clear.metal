@@ -9,3 +9,6 @@ vertex V clr_vs(uint i [[vertex_id]], device const float *z [[buffer(0)]]) { V o
     fragment O_##slot##_##T clr_fs_##slot##_##T(device const T##4 *v [[buffer(0)]]) { O_##slot##_##T o; o.c = v[0]; return o; }
 #define CLR_SLOT(slot) CLR_FS(slot, float) CLR_FS(slot, uint) CLR_FS(slot, int)
 CLR_SLOT(0) CLR_SLOT(1) CLR_SLOT(2) CLR_SLOT(3) CLR_SLOT(4) CLR_SLOT(5) CLR_SLOT(6) CLR_SLOT(7)
+// nan_scrub (nvn_mtl.m, this fork's X40): the pixel as the pass left it, with 0 in place of a NaN or an infinity (an exponent of all ones; tested on the bits, which
+// fast math leaves alone). The fragment reads nothing from buffer 0
+fragment float4 nan_fs_0(float4 c [[color(0)]]) { uint4 b = as_type<uint4>(c); return select(c, float4(0.0), (b & uint4(0x7f800000u)) == uint4(0x7f800000u)); }

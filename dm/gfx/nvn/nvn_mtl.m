@@ -1557,6 +1557,7 @@ void mtl_sub_begin(void) {
 }
 
 static void rp_end_at(const char *fn, int line);
+static void nan_scrub(void);
 // Every render pass end names its call site in a pass dump (E <pass> pass ends in <function>:<line>): a pass that ends with no record of its own was found only by reading the code (Splatoon Raiders'
 // third boss stage, about 1,500 one-draw passes a frame on its ink map, dm/games/0400380020056000/README.md). The line is in the file that holds the function (this one or an .inc it includes), at the build the log came from
 #define rp_end() rp_end_at(__func__, __LINE__)
@@ -5733,6 +5734,7 @@ static void rp_end_at(const char *fn, int line) { if (g_enc) { AP_B; geo_mesh_fl
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
+    nan_scrub();   // X40 (this fork)
     sd_finish(); enc_r_end_pass(g_enc); g_gp_bw_l0 = g_bw_load; g_gp_bw_s0 = g_bw_store;   // the profile's per-pass ledger counts from the previous pass end, profiled or not
     zskip_commit_clears(); g_enc = nil; g_enc_geo_nocolor = 0; g_rt_merged = 0; g_sm_pass = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
@@ -15308,7 +15310,7 @@ static id<MTLRenderPipelineState> clr_pso(const clr_key *k) {
     id<MTLLibrary> lib = clr_lib(); if (!lib) return nil;
     static const char *ty[3] = {"float", "uint", "int"};
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = [lib newFunctionWithName:@"clr_vs"]; if (k->slot >= 0) d.fragmentFunction = [lib newFunctionWithName:[NSString stringWithFormat:@"clr_fs_%d_%s", k->slot, ty[k->kind]]];
+    d.vertexFunction = [lib newFunctionWithName:@"clr_vs"]; if (k->slot >= 0) d.fragmentFunction = [lib newFunctionWithName:k->kind == 3 ? @"nan_fs_0" : [NSString stringWithFormat:@"clr_fs_%d_%s", k->slot, ty[k->kind]]];   // kind 3: nan_scrub's (slot 0)
     for (int i = 0; i < 8; i++) if (k->cfmt[i]) { d.colorAttachments[i].pixelFormat = (MTLPixelFormat)k->cfmt[i]; d.colorAttachments[i].writeMask = MTLColorWriteMaskNone; }   // the other attachments stay as they are
     if (k->slot >= 0) d.colorAttachments[k->slot].writeMask = (MTLColorWriteMask)((k->mask & 1 ? MTLColorWriteMaskRed : 0) | (k->mask & 2 ? MTLColorWriteMaskGreen : 0) | (k->mask & 4 ? MTLColorWriteMaskBlue : 0) | (k->mask & 8 ? MTLColorWriteMaskAlpha : 0));
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->dfmt; d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->sfmt; d.rasterSampleCount = k->samples ? k->samples : 1;
@@ -15346,6 +15348,25 @@ static void clr_tri(id<MTL4RenderCommandEncoder> en, id<MTLRenderPipelineState> 
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0); enc_r_depth_clip(en, YES); enc_r_stencil_ref(en, sref, sref); g_ed.ok = 0;
     enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
     [en setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [en setArgumentTable:g_ft atStages:MTLRenderStageFragment];
+}
+// X40 (this fork): at the end of a render pass that wrote a float colour target in slot 0 (RG11B10F, RGBA16F), one triangle reads each pixel back through the
+// framebuffer and writes 0 where it holds a NaN or an infinity (nan_fs_0, dm/gfx/msl/clear.metal). Ocarina of Time's Fire Temple lava drew dark squares on an iPhone
+// (X36): a non-finite pixel in the scene target that the bloom chain spreads over whole texels of its smaller levels; the console's blender leaves such a pixel out
+// (upstream 0662f9d8 guards it in every pixel shader, which needs the shader chain rebuilt). DM_NVN_NAN_SCRUB=0 turns it off
+static void nan_scrub(void) {
+    static int on = -1; static uint64_t n;
+    if (on < 0) { const char *e = getenv("DM_NVN_NAN_SCRUB"); on = !e || atoi(e) != 0; MLOG("DM_NVN_NAN_SCRUB %s: non-finite pixels of float colour targets are %s at the end of their pass", on ? "on" : "off", on ? "written as 0" : "left"); }
+    if (!on || !g_enc || g_pass.layered || g_pass.samples > 1 || !g_pass.tw || !g_pass.th) return;
+    MTLPixelFormat pf = (MTLPixelFormat)g_pass.cfmt[0];
+    if (pf != MTLPixelFormatRG11B10Float && pf != MTLPixelFormatRGBA16Float) return;
+    int wrote = 0;
+    for (int i = 0; i < g_nsd; i++) if (g_sd[i].depth == 0 && g_sd[i].idx == 0 && g_sd[i].wrote) { wrote = 1; break; }
+    if (!wrote) return;
+    clr_key k; memset(&k, 0, sizeof k); k.slot = 0; k.kind = 3; k.mask = 0xf; memcpy(k.cfmt, g_pass.cfmt, sizeof k.cfmt); k.dfmt = g_pass.dfmt; k.sfmt = g_pass.sfmt; k.samples = g_pass.samples;
+    id<MTLRenderPipelineState> ps = clr_pso(&k); id<MTLDepthStencilState> ds = clr_dss(0, 0); if (!ps || !ds) { on = 0; return; }
+    uint32_t v[4] = {0, 0, 0, 0};
+    clr_tri((id<MTL4RenderCommandEncoder>)g_enc, ps, ds, (MTLScissorRect){0, 0, g_pass.tw, g_pass.th}, v, 0, 0, g_pass.tw, g_pass.th);
+    if (!n++) MLOG("NaN scrub: first pass %llu, %lux%lu Metal format %lu", g_stat_pass, (unsigned long)g_pass.tw, (unsigned long)g_pass.th, (unsigned long)pf);
 }
 static void clear_tex_tri(id<MTLTexture> t, unsigned lv, unsigned l0, const p_clear_tex *c) {
     int mask = c->mask & mtl_pf_chmask(t.pixelFormat); if (!mask) return;
