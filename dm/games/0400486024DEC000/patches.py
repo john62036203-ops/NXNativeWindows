@@ -174,6 +174,20 @@ def frame_step_and_scale(ctx):
 
 FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': frame_step_and_scale}
 
+# Movie pictures (HookLink df4b1f60, its movie cut only: that commit's frame-ratio and frame-time-floor parts are for HookLink's newer frame step, which this fork does not have).
+# The movies are AV1 at 60 pictures a second (Event/Movie/*.webm, no sound track: the opening's Dm_Kokiri_0000 is 9,254 pictures, 154.2 s). The player's update
+# (main+0x3b5ca60, v131072) adds the time object's step (+0x18 x 60, the frame ratio) to a remainder and advances that many picture times, at most the player's limit (+0x20):
+# main+0x3b5cb20. Its queue (main+0x3b61ea0) pops that many decoded pictures and shows the last, so the player can skip. The limit is 1 + (the creation argument >= 2)
+# (main+0x3b5d068 / +0x3b5d084), and the game passes 1 (main+0x3b5c55c): one picture a calc at most, right at 60 calcs a second and nowhere else. At this fork's 2-vsync
+# interval the game steps two ticks a frame (frame_step above), so a movie played at half speed and fell behind its sound. The cut makes the limit 2, the player's own value
+# for an argument of 2 or more (its buffers follow it, +0x50), so a movie keeps its time down to 30 fps. Not run on this fork: carried over from HookLink unchanged.
+#   main+0x3b5cec0, 828 bytes: cinc w8,w28,ge -> add w8,w28,#1 at +0x1c4 (w28 = 1; the flags of cmp w27,#2 are not read again)
+movie = 'movie pictures: up to 2 a calc'
+MATCH_CUTS = {'main': [
+    {'name': movie, 'size': 828, 'fingerprints': ['f61ad468b6b4e1d574fe8678f5a12dfc60e1aab71be7375142a4b48b0d73ce19'],
+     'cuts': [(452, '88b79c1a', '88070011', movie + ' (as v131072 main+0x3b5d084)')]},
+]}
+
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md)
 BINDING = [
     {'what': 'wide view: output and render widths and the 3D camera ratio from the state page', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
@@ -185,4 +199,8 @@ BINDING = [
      'why': "the game's final scale store follows its dynamic and fixed-mode choices",
      'blocked': 'the store and its role are verified for this main build only',
      'checked': 'v131072 main E0F3CCFAF50065AE4EA01EB5AEB13B1A, original store and surrounding code, 2026-11-06'},
+    {'what': movie, 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own movie player takes one picture a calc at most; function-matched (MATCH_CUTS) on any build that keeps the player's constructor",
+     'checked': 'v131072 main: one function with this fingerprint; the limit, its two readers, the update that clamps to it and the queue that skips read by disassembly (2026-11-09, HookLink); '
+                'the opening movie timed on an iPhone before the cut (9,254 pictures in 262 s for 154 s)'},
 ]
