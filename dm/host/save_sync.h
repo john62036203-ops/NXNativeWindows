@@ -30,6 +30,8 @@ int ss_pack(const char *save, const char *title, const char *out, ss_meta *m);
 // Reads a packed save and checks all of it (the header, every entry, the hash, the end marker); with `into`, unpacks it there as into/save and into/save_device.
 // 0 on success; a damaged or cut-off file, or a path that leaves the save, fails
 int ss_read(const char *bundle, const char *into, ss_meta *m);
+// (this fork, X41) A packed save file replaces this device's save, the replaced one kept in the backups (kept: its folder, "" when there was none). 0 on success
+int ss_import(const char *save, const char *bundle, ss_meta *r, char *kept, size_t kn);
 typedef enum { SS_KEEP, SS_PULL, SS_PUSH, SS_ASK } ss_way;
 // Which way, from the three hashes ("" for none: no save here, no sync yet, nothing in the cloud). *both = both changed: then SS_ASK when a front end asks the
 // player (`ask`), else the newer one by the times (the same time: this device's)

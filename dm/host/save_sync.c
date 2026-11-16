@@ -429,6 +429,17 @@ static int pull(const char *save, const char *bundle, ss_meta *r, char *kept, si
     return 0;
 }
 
+// X41 (this fork): a packed save file the player picked replaces this device's save (the launcher's Import save, before the game runs). The file is checked whole
+// first, so a file that is not a save changes nothing; the save it replaces goes to the backups as in pull. 0 on success
+int ss_import(const char *save, const char *bundle, ss_meta *r, char *kept, size_t kn) {
+    ss_meta chk;
+    if (kn) kept[0] = 0;
+    if (ss_read(bundle, NULL, &chk)) { SRED("import: %s is not a packed save, or it is damaged: nothing changed", bundle); return -1; }
+    int e = pull(save, bundle, r, kept, kn);
+    if (e) SRED("import: %s could not replace the save in %s", bundle, save); else SLOG("import: %s (%d files, from %s) is the save now; the one before it is in %s", bundle, r->files, r->device, *kept ? kept : "(there was none)");
+    return e;
+}
+
 // What this device committed goes to the cloud, unless the cloud already has it. It replaces only what it was compared against: no save, the save last synced
 // (<save>.sync), or a damaged file (kept first). A cloud save that changed since this device's last sync (another device sent it, or this device never synced) is
 // not replaced: the next start decides between the two (ss_decide: the newer one, or the player's choice when a front end asks).

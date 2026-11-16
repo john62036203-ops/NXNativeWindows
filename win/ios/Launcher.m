@@ -12,7 +12,9 @@
 // Cloud saves (this fork; the Swift launcher's CloudSavesSection): the iCloud Drive folder the player picks, kept as a bookmark (dm/ios/Sources/CloudSaves.m). front_ios.m puts it into
 // DM_SAVE_SYNC at Play (dm_cloud_saves_env), and the host brings the save in from there at the first save mount and sends it there after each save (dm/host/save_sync.h)
 NSString *dm_cloud_saves_path(BOOL *stale); BOOL dm_store_cloud_saves(NSURL *url); void dm_clear_cloud_saves(void);
+#include <limits.h>
 #include <math.h>
+#include "save_sync.h"   // ss_pack, ss_import: Export save / Import save (X41)
 #include <os/proc.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -217,7 +219,7 @@ static int increased_memory_limit(void) {
 
 // ---- the settings list ----
 @interface DmSettingsVC : UITableViewController <UIDocumentPickerDelegate>
-@property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory; @property (copy) NSString *cloudNote;
+@property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory; @property (copy) NSString *cloudNote; @property (assign) int pickMode;   // pickMode: which picker is up (0 the cloud folder, 1 Import save, 2 Export save)
 @end
 @implementation DmSettingsVC
 - (void)viewDidLoad {
@@ -235,7 +237,7 @@ static int increased_memory_limit(void) {
     if (!f.length && stale && !self.cloudNote) self.cloudNote = @"The folder chosen before can no longer be read (the app was signed differently). Please choose it again.";
     return f.length ? f : nil; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
-    if (sec == self.cloudSection) return self.cloudFolder ? 3 : 2;
+    if (sec == self.cloudSection) return (self.cloudFolder ? 3 : 2) + 2;   // + Export save, Import save (X41)
     return sec < (NSInteger)self.m.sections.count ? (NSInteger)[self.m inSection:self.m.sections[sec]].count : sec > self.cloudSection ? 2 : 1; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? self.m.sections[sec] : sec == self.cloudSection ? @"Cloud saves" : nil; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)sec {
@@ -272,7 +274,14 @@ static int increased_memory_limit(void) {
         }
         UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration]; cfg.contentInsets = NSDirectionalEdgeInsetsZero;
         UIButton *b;
-        if (ip.row == 1) {
+        NSInteger extra = folder ? 3 : 2;   // the rows after the folder's: Export save, Import save (X41)
+        if (ip.row == extra) {
+            cfg.title = @"Export save…";
+            b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [w exportSave]; }]];
+        } else if (ip.row == extra + 1) {
+            cfg.title = @"Import save…";
+            b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [w importSave]; }]];
+        } else if (ip.row == 1) {
             cfg.title = folder ? @"Choose a different folder…" : @"Choose a folder…";
             b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [w pickCloudFolder]; }]];
         } else {
@@ -365,7 +374,34 @@ static int increased_memory_limit(void) {
     }
     return [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsSingleSelection children:items];
 }
+// X41 (this fork): the save as one file, for a cloud app that gives no folder (Google Drive, Dropbox under LiveContainer). Export packs the committed save
+// (ss_pack, the cloud saves' own format) and hands the file to the system's export picker; Import takes such a file and puts it in place of this device's save
+// (ss_import: checked whole first, the replaced save kept in save-backups). Both run here, before the game starts
+- (NSString *)savePath { const char *e = getenv("DM_SAVE"); if (e && *e) return @(e);
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"save"]; }
+- (void)presentPicker:(UIDocumentPickerViewController *)pk {
+    pk.delegate = self; pk.allowsMultipleSelection = NO; pk.modalPresentationStyle = UIModalPresentationFormSheet;
+    UIViewController *top = self.parentViewController ?: self; while (top.presentedViewController) top = top.presentedViewController;
+    [top presentViewController:pk animated:YES completion:nil];
+}
+- (void)exportSave {
+    ss_meta m; memset(&m, 0, sizeof m);
+    NSDateFormatter *df = [NSDateFormatter new]; df.dateFormat = @"yyyyMMdd-HHmm";
+    NSString *tid = NSBundle.mainBundle.bundleIdentifier.pathExtension.uppercaseString ?: @"";
+    NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"save-%@-%@.dmsync", tid, [df stringFromDate:NSDate.date]]];
+    [NSFileManager.defaultManager removeItemAtPath:out error:nil];
+    int e = ss_pack(self.savePath.fileSystemRepresentation, tid.UTF8String, out.fileSystemRepresentation, &m);
+    fprintf(stderr, "launcher: export save: %s, %d files, result %d\n", out.UTF8String, m.files, e);
+    if (e || !m.files) { self.cloudNote = e ? @"The save could not be packed." : @"There is no save on this device yet."; [self.tableView reloadData]; return; }
+    self.pickMode = 2;
+    [self presentPicker:[[UIDocumentPickerViewController alloc] initForExportingURLs:@[[NSURL fileURLWithPath:out]] asCopy:YES]];
+}
+- (void)importSave {
+    self.pickMode = 1; fprintf(stderr, "launcher: import save: choosing the file\n");
+    [self presentPicker:[[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem] asCopy:YES]];
+}
 - (void)pickCloudFolder {   // .open, not a copy: the folder stays where it is and the bookmark keeps pointing at it
+    self.pickMode = 0;
     UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
     pk.delegate = self; pk.allowsMultipleSelection = NO; pk.modalPresentationStyle = UIModalPresentationFormSheet;
     UIViewController *top = self.parentViewController ?: self; while (top.presentedViewController) top = top.presentedViewController;
@@ -374,6 +410,15 @@ static int increased_memory_limit(void) {
 }
 - (void)documentPicker:(UIDocumentPickerViewController *)pk didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject; if (!url) return;
+    if (self.pickMode == 2) { self.pickMode = 0; fprintf(stderr, "launcher: export save: written to %s\n", url.path.UTF8String ?: "?");
+        self.cloudNote = @"Save exported. Use Import save on the other device to load this file."; [self.tableView reloadData]; return; }
+    if (self.pickMode == 1) { self.pickMode = 0;
+        BOOL sc = [url startAccessingSecurityScopedResource]; ss_meta r; memset(&r, 0, sizeof r); char kept[PATH_MAX]; kept[0] = 0;
+        int e = ss_import(self.savePath.fileSystemRepresentation, url.fileSystemRepresentation, &r, kept, sizeof kept);
+        if (sc) [url stopAccessingSecurityScopedResource];
+        self.cloudNote = e ? @"That file is not a save exported by this app, or it is damaged. Nothing was changed."
+                           : [NSString stringWithFormat:@"Save imported (%d files). The save it replaced is kept in save-backups.", r.files];
+        [self.tableView reloadData]; return; }
     BOOL scoped = [url startAccessingSecurityScopedResource];   // a bookmark of a picked folder is made inside its scope
     BOOL ok = dm_store_cloud_saves(url);
     if (scoped) [url stopAccessingSecurityScopedResource];
