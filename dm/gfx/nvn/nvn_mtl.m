@@ -14439,7 +14439,7 @@ static void mtk_predict(NSString *tkey, NSString *mkey, NSString *fkey) {
         uint64_t t0 = bp_now(); int made = 0, arch = 0;
         for (int i = 0; i < n && i < want; i++) {
             pso_key k = st[i]; NSError *error = nil; int archived = 0;
-            int archived = 0; id<MTLRenderPipelineState> ps = mtk_build(&k, ts, ms, fs, &error, &archived);   // this fork's mtk_build takes the archive flag (unused here)
+            id<MTLRenderPipelineState> ps = mtk_build(&k, ts, ms, fs, &error, &archived);   // this fork's mtk_build takes the archive flag (unused here)
             if (!ps) continue;   // a state these functions do not fit (Metal refuses the pair): no draw makes that key
             WarmItem *item = [WarmItem new]; item->kind = 3; item->pso = k; item->object = ps;
             item->vs = ms; item->vs_key = mkey; item->fs = fs; item->fs_key = fkey; item->ts = ts; item->ts_key = tkey;
