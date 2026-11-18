@@ -11,6 +11,7 @@
 // one last synced, damaged, or the one the start chose against. A cloud that changed since (or that the start could not read) waits for the next start.
 // Every save this replaces, here or in the cloud, is kept first in <DM_SAVE>-backups/<date> <side>; the newest 10 of each side stay.
 #pragma once
+#include <stddef.h>   // size_t (ss_import)
 #include <stdint.h>
 
 #define SS_HASH 32   // hex digits of a save's hash: the first 16 bytes of a SHA-256
