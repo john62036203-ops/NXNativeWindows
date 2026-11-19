@@ -31,8 +31,11 @@ zip_store	.zs:.bwav:.webm:.metallib
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
 # nninitStartup asks SetHeapSize 0x18ce00000 (6.2 GB) with the 9 GB pool, as Mario Kart World. 256 MB in front + 4 GB alias region + 256 MB stack region + 8 GB heap region: a starting split, to be measured
-mem_reserve	0x320000000
-mem_alias	0x100000000
+# X44 (this fork): an 8 GB alias region for an 8 GB iPhone, with the map limit kept on. With 4 GB the game ran out of addresses at +3.75 GB (2.5-2.74 GB mapped, the rest
+# fragmentation): a white screen, and the player stuck while Lon Lon Ranch loaded (X41, 2 of 2). With 8 GB and the limit off (upstream 0840c94d, X43) it mapped 4.25 GB and the
+# footprint rose from 3.9 to 4.5 GB: closed at area loads. The limit on keeps what is mapped at 2.74 GB (the SDK frees cached pages and retries); mem_reserve grows by the same 4 GB
+mem_reserve	0x420000000
+mem_alias	0x200000000
 mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000
