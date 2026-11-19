@@ -255,6 +255,15 @@ static uint64_t app_pool_now(void) {
     }
     return v;
 }
+// X45 (this fork): DM_MAP_EXTRA_MB=<MB> (default 512, 0 = none, at most 4096): with the profile's mem_map_limit, the alias region may hold this much more than the pool leaves it,
+// and that much of what is mapped there is left out of the used memory GetInfo reports, so the game sees the room it is given. On an 8 GB iPhone Ocarina of Time with the limit
+// (2.74 GB mapped) stops loading an area and the player stands still (X44); without it it maps 4.25 GB and iOS ends it at area loads (X43). A middle to be measured
+static int64_t map_extra(void) {
+    static int64_t x = -1;
+    if (x < 0) { const char *e = getenv("DM_MAP_EXTRA_MB"); long mb = e && *e ? atol(e) : 512; if (mb < 0) mb = 0; if (mb > 4096) mb = 4096; x = (int64_t)mb << 20;
+        if (DM_GAME_MEM_MAP_LIMIT) LOG("[mem] map limit: %ld MB more than the application pool leaves the alias region (DM_MAP_EXTRA_MB)", mb); }
+    return x;
+}
 #define APP_POOL app_pool_now()   // game profile app_pool (Mario 0xCD500000), or DM_APP_POOL_GB
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro) n += g_mod[i].size;   // an NRO lives in memory the game allocated (its image and bss buffers)
     return (n + 0x1fffff) & ~(size_t)0x1fffff; }
@@ -857,7 +866,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
         // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
         if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
-            int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
+            int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped) + map_extra();   // X45: DM_MAP_EXTRA_MB
             if (need && need > room) {
                 pthread_mutex_unlock(&g_map_lock);
                 static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
@@ -925,7 +934,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_UsedMem:  case I_UsedNonSys:  pthread_mutex_lock(&g_map_lock);
                                              v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
                                              // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
-                                             if (DM_GAME_MEM_MAP_LIMIT) v += (uint64_t)atomic_load(&g_alias_mapped);
+                                             if (DM_GAME_MEM_MAP_LIMIT) { int64_t am = (int64_t)atomic_load(&g_alias_mapped) - map_extra(); if (am > 0) v += (uint64_t)am; }   // X45: the extra room is not reported as used
                                              pthread_mutex_unlock(&g_map_lock); break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)
